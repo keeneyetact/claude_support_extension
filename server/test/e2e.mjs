@@ -347,6 +347,22 @@ async function main() {
     const shot = await browser.send('Page.captureScreenshot', { format: 'png' }, popup);
     if (process.env.DASHBOARD_SHOT) fs.writeFileSync(process.env.DASHBOARD_SHOT, Buffer.from(shot.data, 'base64'));
 
+    // ---- "Copy prompt for Claude": the prompt names the profile, the tab, and how to connect
+    check('extension learned the server script path', /server[\\/]index\.js$/.test(st.serverScript || ''), st.serverScript);
+    const owned = await browser.evaluate(popup, `chrome.runtime.sendMessage({ type: 'getStatus' }).then(async (st) => {
+      const tab = await chrome.tabs.get(${Number(testTab)});
+      const owner = st.sessions.find((s) => s.tab && s.tab.id === tab.id) || null;
+      return buildPrompt(st, tab, owner, 'Click the Increment button');
+    })`);
+    check('prompt names profile, tab id and URL', owned.includes(`profile "E2E"`) && owned.includes(`tab_select with tabId ${Number(testTab)}`) && /\n- URL: \S+/.test(owned), owned);
+    check('prompt for a tab another session holds says takeOver', /takeOver: true/.test(owned) && /Session C\d/.test(owned), owned);
+    check('prompt includes the task and the setup fallback', owned.includes('Task: Click the Increment button') && /claude mcp add --scope user chrome-bridge -- node ".*server\/index\.js"/.test(owned), owned);
+    const free = await browser.evaluate(popup, `chrome.runtime.sendMessage({ type: 'getStatus' }).then((st) =>
+      buildPrompt(st, { id: 999999, title: 'Free', url: 'https://example.com/' }, null, ''))`);
+    check('prompt for a free tab has no takeOver', !/takeOver/.test(free) && /wait for my instructions/.test(free), free);
+    const ownerText = await browser.evaluate(popup, `document.getElementById('handoffOwner').textContent + '|' + document.getElementById('copyPrompt').disabled`);
+    check('popup refuses to hand over a chrome-extension:// page', /doesn't let extensions/.test(ownerText) && ownerText.endsWith('|true'), ownerText);
+
     r = await callB('tab_select', { tabId: Number(testTab), takeOver: true });
     check('takeOver lets a session take a tab when asked', !r.isError, text(r));
     await clientB.close();

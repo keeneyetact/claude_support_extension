@@ -60,6 +60,21 @@ function logItem(a) {
   return li;
 }
 
+function fillTabRow(box, tab) {
+  const nodes = [];
+  if (tab.favIconUrl && /^(https?|data):/.test(tab.favIconUrl)) {
+    const img = el('img');
+    img.src = tab.favIconUrl;
+    img.onerror = () => img.replaceWith(el('span', 'noicon'));
+    nodes.push(img);
+  } else nodes.push(el('span', 'noicon'));
+  const txt = el('div', 'txt');
+  txt.append(el('div', 't', (tab.status === 'loading' ? '⟳ ' : '') + (tab.title || '(no title)')));
+  txt.append(el('div', 'u', tab.pendingUrl || tab.url || ''));
+  nodes.push(txt);
+  box.replaceChildren(...nodes);
+}
+
 function sessionCard(s) {
   const card = el('div', 'card');
   card.style.setProperty('--c', s.color);
@@ -81,16 +96,7 @@ function sessionCard(s) {
   if (s.tab) {
     const b = el('button', 'tab');
     b.title = 'Show this tab';
-    if (s.tab.favIconUrl && /^(https?|data):/.test(s.tab.favIconUrl)) {
-      const img = el('img');
-      img.src = s.tab.favIconUrl;
-      img.onerror = () => img.replaceWith(el('span', 'noicon'));
-      b.append(img);
-    } else b.append(el('span', 'noicon'));
-    const txt = el('div', 'txt');
-    txt.append(el('div', 't', (s.tab.status === 'loading' ? '⟳ ' : '') + (s.tab.title || '(no title)')));
-    txt.append(el('div', 'u', s.tab.url || ''));
-    b.append(txt);
+    fillTabRow(b, s.tab);
     b.addEventListener('click', () => send({ type: 'focusTab', tabId: s.tab.id }));
     card.append(b);
   } else {
@@ -105,6 +111,95 @@ function sessionCard(s) {
   return card;
 }
 
+// ---------------------------------------------------------------- hand a tab to Claude
+
+// Pages no extension may control.
+const RESTRICTED = /^(chrome|edge|about|devtools|view-source|chrome-extension|chrome-search|chrome-untrusted):|^https:\/\/(chromewebstore\.google\.com|chrome\.google\.com\/webstore)/i;
+
+let lastStatus = null;
+let currentTab = null;
+
+/** The prompt a user pastes into any Claude Code session to make it drive this tab. */
+function buildPrompt(st, tab, owner, task) {
+  const script = (st.serverScript || '<path to claude_support_extension>/server/index.js').replace(/\\/g, '/');
+  const lines = [
+    'Use my real Chrome browser through the chrome-bridge MCP tools (Claude Browser Bridge).',
+    '',
+    'Work in this tab:',
+    `- Chrome profile: "${st.label}"`,
+    `- Tab id: ${tab.id}`,
+    `- Title: ${tab.title || '(no title)'}`,
+    `- URL: ${tab.pendingUrl || tab.url}`,
+    '',
+    'Connect like this:',
+    `1. select_profile with profile "${st.label}".`,
+    owner
+      ? `2. tab_select with tabId ${tab.id} and takeOver: true. Session C${owner.number} ("${owner.label}") had this tab, and I am handing it to you.`
+      : `2. tab_select with tabId ${tab.id}.`,
+    '   If that tab id no longer exists (Chrome was restarted), call tabs_list and select the tab with the URL above. If none matches, use tab_new with that URL.',
+    '3. Read the page with snapshot (use screenshot when the layout matters), then act with click, type, press_key and so on, using the [ref=eN] refs from the snapshot.',
+    '',
+    "Rules: stay in this tab and don't touch my other tabs unless I ask. Ask me before you submit payments, send messages, delete things, or do anything else that is hard to undo.",
+    '',
+    task
+      ? 'Task: ' + task
+      : 'Task: when you are connected, tell me the page title and wait for my instructions.',
+    '',
+    'If you have no chrome-bridge tools (select_profile, tab_select, snapshot...), the MCP server is not registered in this Claude Code. In that case run this command:',
+    `  claude mcp add --scope user chrome-bridge -- node "${script}"`,
+    'Then tell me to restart Claude Code and paste this prompt again. Stop there.',
+  ];
+  return lines.join('\n');
+}
+
+async function renderHandoff(st) {
+  let tab = null;
+  try {
+    [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  } catch (_) { /* ignore */ }
+  currentTab = tab || null;
+  const btn = $('copyPrompt');
+  if (!tab) {
+    $('handoffTab').replaceChildren(el('div', 'notab', 'No active tab in this window.'));
+    btn.disabled = true;
+    return;
+  }
+  fillTabRow($('handoffTab'), tab);
+  const owner = st.sessions.find((s) => s.tab && s.tab.id === tab.id) || null;
+  const url = tab.pendingUrl || tab.url || '';
+  const restricted = RESTRICTED.test(url);
+  $('handoffOwner').textContent = restricted
+    ? "Chrome doesn't let extensions control this page"
+    : owner ? `Controlled by C${owner.number} · ${owner.label}` : 'Not controlled by Claude';
+  btn.disabled = restricted || !st.settings.enabled;
+  $('promptPreview').textContent = restricted ? '' : buildPrompt(st, tab, owner, $('task').value.trim());
+}
+
+async function copyPrompt() {
+  const st = lastStatus;
+  const tab = currentTab;
+  if (!st || !tab) return;
+  const owner = st.sessions.find((s) => s.tab && s.tab.id === tab.id) || null;
+  const text = buildPrompt(st, tab, owner, $('task').value.trim());
+  try {
+    await navigator.clipboard.writeText(text);
+    $('copied').textContent = 'Copied. Paste it into your Claude Code session.';
+  } catch (_) {
+    // Fallback for contexts without clipboard permission.
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.append(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove();
+    $('copied').textContent = ok ? 'Copied. Paste it into your Claude Code session.' : 'Copy failed. Use the preview below.';
+  }
+  setTimeout(() => { $('copied').textContent = ''; }, 4000);
+}
+
+$('copyPrompt').addEventListener('click', copyPrompt);
+$('task').addEventListener('input', () => { if (lastStatus) renderHandoff(lastStatus); });
+
 let formFilled = false;
 
 async function refresh() {
@@ -116,6 +211,8 @@ async function refresh() {
     return;
   }
   if (!st || !st.settings) return;
+  lastStatus = st;
+  renderHandoff(st);
   const n = st.sessions.length;
   const working = st.sessions.filter((s) => s.running.length).length;
   $('enabled').checked = !!st.settings.enabled;

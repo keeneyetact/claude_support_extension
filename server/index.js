@@ -7,6 +7,7 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -147,6 +148,8 @@ class Bridge {
             port: this.port,
             // Shown in the extension popup and the tab-group title; defaults to the project folder name.
             label: SESSION_NAME,
+            // Lets the extension build a copy-paste 'claude mcp add' command for new sessions.
+            script: fileURLToPath(import.meta.url),
           },
         });
         log(`profile connected: "${conn.info.label}" (${conn.info.profileId.slice(0, 8)}, ext v${conn.info.extensionVersion})`);

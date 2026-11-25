@@ -44,6 +44,18 @@ Repeat this for every profile. While a Claude session is running, the toolbar ba
 
 ## Use
 
+### Give a tab to a Claude session (easiest)
+
+1. In Chrome, go to the tab you want Claude to work in.
+2. Click the extension icon. Optionally, type what Claude should do.
+3. Click **Copy prompt for Claude** and paste it into any Claude Code session.
+
+The prompt tells the session which profile and tab to use (`select_profile`, then `tab_select`), what to do if the tab id has changed, and to stay in that tab. If another session holds the tab, the prompt says you're handing it over (`takeOver: true`). If the session doesn't have the chrome-bridge tools yet, the prompt gives it the exact `claude mcp add` command to run, and it asks you to restart.
+
+To have several sessions work at once, copy a prompt from a different tab for each one.
+
+### Or just ask
+
 Just ask Claude, for example:
 
 > Using my Work Chrome profile, open my Gmail and summarise unread mail from today.

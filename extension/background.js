@@ -24,6 +24,8 @@ const SESSION_LOG_SIZE = 30;
 let settings = { ...DEFAULTS };
 let profileId = null;
 let email = '';
+/** Path of server/index.js, learned from the last session that connected (for the copied prompt). */
+let serverScript = '';
 /** port -> connection; once open it is also the session context used by commands.js */
 const conns = new Map();
 const activity = [];
@@ -35,7 +37,8 @@ let loopsStarted = false;
 function init() {
   if (!initPromise) {
     initPromise = (async () => {
-      const stored = await chrome.storage.local.get(['settings', 'profileId']);
+      const stored = await chrome.storage.local.get(['settings', 'profileId', 'serverScript']);
+      serverScript = stored.serverScript || '';
       settings = { ...DEFAULTS, ...(stored.settings || {}) };
       configure({ groupTabs: settings.groupTabs });
       profileId = stored.profileId;
@@ -292,6 +295,11 @@ function startSession(c) {
     badge: 'C' + n,
     badgeColor: hex,
   });
+  const script = typeof c.server.script === 'string' ? c.server.script : '';
+  if (script && script !== serverScript) {
+    serverScript = script;
+    chrome.storage.local.set({ serverScript }).catch(() => {});
+  }
 }
 
 function endSession(c) {
@@ -376,6 +384,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           profileId,
           email,
           label: profileLabel(),
+          serverScript,
           ports: ports(),
           sessions,
           attachedTabs: attachedTabIds().length,
