@@ -40,6 +40,7 @@ r = await connect(a.port, { origin: null });
 check('missing origin rejected', r.status === 403, JSON.stringify(r));
 r = await connect(a.port);
 check('extension origin accepted (no token)', !!r.welcome && r.welcome.server.pid > 0, JSON.stringify(r));
+check('welcome describes the Claude session', !!r.welcome && typeof r.welcome.server.session === 'object' && 'title' in r.welcome.server.session, JSON.stringify(r.welcome && r.welcome.server.session));
 r = await connect(b.port, { token: 'wrong' });
 check('wrong token rejected', r.closed === 4001, JSON.stringify(r));
 r = await connect(b.port, { token: 's3cret' });

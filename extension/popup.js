@@ -93,10 +93,54 @@ function chip(s) {
   return c;
 }
 
+/** The name people know a session by: its conversation title (as in the VS Code tab), else its folder. */
+const sessionName = (s) => (s.session && s.session.title) || s.label;
+
+const WHERE = { 'claude-vscode': 'VS Code', cli: 'terminal', 'sdk-cli': 'SDK', 'sdk-ts': 'SDK', 'sdk-py': 'SDK' };
+const CHAT = { busy: 'Claude is busy', idle: 'waiting for you' };
+
+/** "auto-bid · VS Code · waiting for you" */
+function sessionSub(s) {
+  const ss = s.session || {};
+  const bits = [];
+  if (ss.title) bits.push(s.label);
+  if (ss.entrypoint) bits.push(WHERE[ss.entrypoint] || ss.entrypoint);
+  if (ss.status) bits.push(CHAT[ss.status] || ss.status);
+  return bits.join(' · ');
+}
+
+const canOpen = (s) => !!(s.session && s.session.id && s.session.entrypoint === 'claude-vscode');
+
+/** Feedback of the last "Go to session" click per session; the popup is rebuilt every second. */
+const goState = new Map();
+
+/** Button that brings the session's chat into view in VS Code. */
+function goButton(s, cls = 'go') {
+  const st = goState.get(s.number);
+  const busy = st && st.until > Date.now();
+  const b = el('button', cls, busy ? st.text : 'Go to session ↗');
+  b.disabled = !!busy;
+  b.title = busy && st.error ? st.error : `Show "${sessionName(s)}" in VS Code`;
+  b.addEventListener('click', async (ev) => {
+    ev.stopPropagation();
+    goState.set(s.number, { text: 'Opening…', until: Date.now() + 10000 });
+    b.disabled = true;
+    b.textContent = 'Opening…';
+    const r = await send({ type: 'openSession', number: s.number }).catch((e) => ({ ok: false, error: e.message }));
+    const ok = r && r.ok;
+    goState.set(s.number, { text: ok ? 'Opened in VS Code' : 'Failed', error: ok ? '' : (r && r.error) || 'Could not open the session', until: Date.now() + (ok ? 2500 : 6000) });
+    if (!ok) $('summary').textContent = goState.get(s.number).error;
+    refresh();
+  });
+  return b;
+}
+
 function facts(s) {
   const dl = el('dl', 'facts');
   const fact = (k, v) => { if (v == null || v === '') return; dl.append(el('dt', '', k), el('dd', '', String(v))); };
   fact('Tab', s.tab ? `id ${s.tab.id} · window ${s.tab.windowId}${s.tab.active ? ' · active in its window' : ''}` : 'none');
+  fact('Conversation', s.session && s.session.title);
+  fact('Session id', s.session && s.session.id);
   fact('Folder', s.cwd);
   fact('Server', `port ${s.port}${s.pid ? ` · pid ${s.pid}` : ''}${s.serverVersion ? ` · v${s.serverVersion}` : ''}`);
   fact('Connected', ago(s.connectedAt));
@@ -115,10 +159,17 @@ function detailsBlock(s) {
 function cardHead(s, stateText, working) {
   const head = el('div', 'card-head');
   const name = el('div', 'name');
-  name.append(chip(s), el('span', '', s.label));
-  name.title = s.cwd || s.label;
+  name.append(chip(s), el('span', '', sessionName(s)));
+  name.title = [sessionName(s), s.cwd].filter(Boolean).join('\n');
   head.append(name, el('span', 'state' + (working ? ' working' : ''), stateText));
-  return head;
+  const sub = sessionSub(s);
+  if (!sub && !canOpen(s)) return head;
+  const wrap = el('div', 'head-wrap');
+  const line = el('div', 'sub-row');
+  line.append(el('span', 'sub', sub));
+  if (canOpen(s)) line.append(goButton(s));
+  wrap.append(head, line);
+  return wrap;
 }
 
 function sessionCard(s) {
@@ -209,7 +260,7 @@ function buildPrompt(st, tab, owner, task) {
     'Connect like this:',
     `1. select_profile with profile "${st.label}".`,
     owner
-      ? `2. tab_select with tabId ${tab.id} and takeOver: true. Session C${owner.number} ("${owner.label}") had this tab, and I am handing it to you.`
+      ? `2. tab_select with tabId ${tab.id} and takeOver: true. Session C${owner.number} ("${sessionName(owner)}") had this tab, and I am handing it to you.`
       : `2. tab_select with tabId ${tab.id}.`,
     '   If that tab id no longer exists (Chrome was restarted), call tabs_list and select the tab with the URL above. If none matches, use tab_new with that URL.',
     '3. Read the page with snapshot (use screenshot when the layout matters), then act with click, type, press_key and so on, using the [ref=eN] refs from the snapshot.',
@@ -267,7 +318,7 @@ async function renderThisTab(st) {
     status.style.setProperty('--c', owner.color);
     const txt = el('div', 'stxt');
     const who = el('div', 'swho');
-    who.append(chip(owner), el('span', 'slabel', owner.label));
+    who.append(chip(owner), el('span', 'slabel', sessionName(owner)));
     txt.append(el('div', 'sline1', 'Controlled by Claude'), who, el('div', 'sline2', ost.text));
     const show = el('button', 'link', 'Show session');
     show.addEventListener('click', () => {
@@ -278,7 +329,10 @@ async function renderThisTab(st) {
       void card.offsetWidth; // restart the animation
       card.classList.add('flash');
     });
-    status.replaceChildren(el('span', 'sdot'), txt, show);
+    const btns = el('div', 'sbtns');
+    if (canOpen(owner)) btns.append(goButton(owner, 'link'));
+    btns.append(show);
+    status.replaceChildren(el('span', 'sdot'), txt, btns);
   } else {
     mode = 'free';
     status.classList.add('free');

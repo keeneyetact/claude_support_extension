@@ -273,6 +273,16 @@ async function onMessage(c, msg) {
       }
       break;
     }
+    case 'session':
+      // The Claude session's id, conversation title or busy/idle state changed.
+      if (c.server) c.server.session = msg.session || {};
+      break;
+    case 'open-session-result': {
+      const w = c.openWaiter;
+      c.openWaiter = null;
+      if (w) w(msg);
+      break;
+    }
     case 'error':
       logActivity(c, { method: 'server-error', ok: false, detail: msg.message });
       break;
@@ -389,6 +399,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             commands: c.commands,
             errors: c.errors,
             serverVersion: c.server.version,
+            session: c.server.session || null,
             running: [...c.running.values()],
             tab,
             activity: c.activity.slice(0, 8),
@@ -411,7 +422,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const c = settings.enabled && sender.tab ? ownerOf(sender.tab.id) : null;
         if (!c || !c.connected) return { owner: null };
         const running = c.running.values().next().value;
-        return { owner: { number: c.number, label: c.label, color: c.badgeColor, working: running ? (DOING[running.method] || 'working') : '' } };
+        return { owner: { number: c.number, label: (c.server.session && c.server.session.title) || c.label, color: c.badgeColor, working: running ? (DOING[running.method] || 'working') : '' } };
+      }
+      case 'openSession': {
+        // Ask the session's bridge server to bring its chat into view in VS Code.
+        const c = openConns().find((o) => o.number === Number(msg.number));
+        if (!c) return { ok: false, error: 'That session is no longer connected.' };
+        const result = new Promise((resolve) => {
+          c.openWaiter = resolve;
+          setTimeout(() => { if (c.openWaiter === resolve) { c.openWaiter = null; resolve({ ok: false, message: 'This session runs an older bridge server. Restart the Claude session to get the "Go to session" button.' }); } }, 3000);
+        });
+        safeSend(c, { type: 'open-session' });
+        const r = await result;
+        return r.ok ? { ok: true } : { ok: false, error: r.message };
       }
       case 'focusTab': {
         const t = await chrome.tabs.update(Number(msg.tabId), { active: true });

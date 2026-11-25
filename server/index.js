@@ -6,7 +6,9 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
 import path from 'node:path';
-import { readFileSync } from 'node:fs';
+import os from 'node:os';
+import { spawn } from 'node:child_process';
+import { readFileSync, existsSync, readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { z } from 'zod';
@@ -22,6 +24,134 @@ const PROTOCOL_VERSION = 1;
 const SESSION_NAME = process.env.CHROME_BRIDGE_SESSION_NAME || path.basename(process.cwd()) || '';
 
 const log = (...a) => console.error('[chrome-bridge]', ...a);
+
+// ------------------------------------------------------------------ which Claude session runs us
+
+const CLAUDE_DIR = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
+const SESSION_POLL_MS = 3000;
+
+/**
+ * Follows the Claude Code session that started this server (our parent process): its id, the
+ * conversation title shown in the editor tab, where it runs (VS Code or a terminal) and whether it
+ * is busy. Claude Code keeps ~/.claude/sessions/<pid>.json up to date (the id changes on /clear),
+ * and the title is the last ai-title / custom-title record in the session transcript.
+ */
+class SessionInfo {
+  constructor(onChange) {
+    this.onChange = onChange;
+    this.info = { id: process.env.CLAUDE_CODE_SESSION_ID || '', title: '', entrypoint: process.env.CLAUDE_CODE_ENTRYPOINT || '', status: '' };
+    this.transcript = null; // { id, file, offset, rest, title }
+  }
+
+  start() {
+    this.poll();
+    setInterval(() => this.poll(), SESSION_POLL_MS).unref();
+  }
+
+  readProcFile() {
+    try {
+      return JSON.parse(readFileSync(path.join(CLAUDE_DIR, 'sessions', `${process.ppid}.json`), 'utf8'));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  findTranscript(id, cwd) {
+    const slug = (p) => String(p).replace(/[^a-zA-Z0-9]/g, '-');
+    const projects = path.join(CLAUDE_DIR, 'projects');
+    const direct = path.join(projects, slug(cwd), `${id}.jsonl`);
+    if (existsSync(direct)) return direct;
+    try {
+      for (const d of readdirSync(projects)) {
+        const f = path.join(projects, d, `${id}.jsonl`);
+        if (existsSync(f)) return f;
+      }
+    } catch (_) { /* no projects dir */ }
+    return null;
+  }
+
+  /** Reads only what was appended to the transcript since the last poll. */
+  readTitle(id, cwd) {
+    let t = this.transcript;
+    if (!t || t.id !== id) t = this.transcript = { id, file: null, offset: 0, rest: '', title: '' };
+    if (!t.file) t.file = this.findTranscript(id, cwd);
+    if (!t.file) return t.title;
+    let fd;
+    try {
+      const size = statSync(t.file).size;
+      if (size < t.offset) { t.offset = 0; t.rest = ''; }
+      if (size === t.offset) return t.title;
+      fd = openSync(t.file, 'r');
+      const buf = Buffer.alloc(size - t.offset);
+      readSync(fd, buf, 0, buf.length, t.offset);
+      t.offset = size;
+      const lines = (t.rest + buf.toString('utf8')).split('\n');
+      t.rest = lines.pop();
+      let custom = t.custom || '';
+      for (const line of lines) {
+        if (!line.includes('-title"')) continue;
+        try {
+          const r = JSON.parse(line);
+          if (r.type === 'custom-title' && r.customTitle) custom = String(r.customTitle);
+          else if (r.type === 'ai-title' && r.aiTitle) t.ai = String(r.aiTitle);
+        } catch (_) { /* partial line */ }
+      }
+      t.custom = custom;
+      t.title = custom || t.ai || '';
+    } catch (_) {
+      /* transcript unreadable right now; keep the last title */
+    } finally {
+      if (fd !== undefined) closeSync(fd);
+    }
+    return t.title;
+  }
+
+  poll() {
+    const proc = this.readProcFile();
+    const id = (proc && proc.sessionId) || this.info.id;
+    const next = {
+      id,
+      title: id ? this.readTitle(id, (proc && proc.cwd) || process.cwd()) : '',
+      entrypoint: (proc && proc.entrypoint) || this.info.entrypoint,
+      status: (proc && proc.status) || '',
+    };
+    if (JSON.stringify(next) !== JSON.stringify(this.info)) {
+      this.info = next;
+      this.onChange(next);
+    }
+  }
+}
+
+/** URL scheme of the editor that hosts this session, from the path of the claude binary it ships. */
+function editorScheme() {
+  const p = String(process.env.CLAUDE_CODE_EXECPATH || '').toLowerCase();
+  if (p.includes('.vscode-insiders')) return 'vscode-insiders';
+  if (p.includes('.cursor')) return 'cursor';
+  if (p.includes('.windsurf')) return 'windsurf';
+  return 'vscode';
+}
+
+function openExternal(url) {
+  const [cmd, args] = process.platform === 'win32' ? ['rundll32', ['url.dll,FileProtocolHandler', url]]
+    : process.platform === 'darwin' ? ['open', [url]] : ['xdg-open', [url]];
+  const p = spawn(cmd, args, { detached: true, stdio: 'ignore', windowsHide: true });
+  p.on('error', (e) => log(`could not open ${url}: ${e.message}`));
+  p.unref();
+}
+
+/**
+ * Bring this session's chat into view in VS Code. Opening the workspace folder first focuses the
+ * window that has it open, so the session link is then handled by that window (VS Code sends
+ * links to the last active window) and reveals the existing tab instead of starting a copy.
+ */
+function revealSession(info) {
+  if (!info.id) throw new Error('This Claude session has no session id.');
+  if (info.entrypoint !== 'claude-vscode') throw new Error(`This Claude session runs in ${info.entrypoint || 'a terminal'}, not in VS Code.`);
+  const scheme = editorScheme();
+  const folder = process.cwd().replace(/\\/g, '/');
+  openExternal(`${scheme}://file/${encodeURI(folder.startsWith('/') ? folder.slice(1) : folder)}`);
+  setTimeout(() => openExternal(`${scheme}://anthropic.claude-code/open?session=${encodeURIComponent(info.id)}`), 900);
+}
 const hmac = (key, data) => crypto.createHmac('sha256', key).update(data).digest('hex');
 const safeEqual = (a, b) => typeof a === 'string' && typeof b === 'string' && a.length === b.length &&
   crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
@@ -150,6 +280,8 @@ class Bridge {
             label: SESSION_NAME,
             // Lets the extension build a copy-paste 'claude mcp add' command for new sessions.
             script: fileURLToPath(import.meta.url),
+            // The Claude Code session: id, conversation title, editor/terminal, busy/idle.
+            session: sessionInfo.info,
           },
         });
         log(`profile connected: "${conn.info.label}" (${conn.info.profileId.slice(0, 8)}, ext v${conn.info.extensionVersion})`);
@@ -166,6 +298,15 @@ class Bridge {
         return;
       }
       if (msg.type === 'ping') send({ type: 'pong', t: msg.t });
+      if (msg.type === 'open-session' && conn.info) {
+        // Asked from the extension popup. Only ever opens this server's own session.
+        try {
+          revealSession(sessionInfo.info);
+          send({ type: 'open-session-result', ok: true });
+        } catch (e) {
+          send({ type: 'open-session-result', ok: false, message: e.message });
+        }
+      }
     });
 
     ws.on('close', () => {
@@ -258,6 +399,9 @@ class Bridge {
 }
 
 const bridge = new Bridge();
+const sessionInfo = new SessionInfo((info) => {
+  for (const c of bridge.list()) c.send({ type: 'session', session: info });
+});
 
 // ------------------------------------------------------------------ MCP side
 
@@ -514,6 +658,7 @@ browserTool('extension_reload', 'Reload an unpacked (developer) Chrome extension
 // ------------------------------------------------------------------ start
 
 async function main() {
+  sessionInfo.start();
   await bridge.listen();
   const transport = new StdioServerTransport();
   await mcp.connect(transport);

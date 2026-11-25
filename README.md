@@ -54,6 +54,10 @@ The prompt tells the session which profile and tab to use (`select_profile`, the
 
 To have several sessions work at once, copy a prompt from a different tab for each one.
 
+### Find the Claude session behind a tab
+
+Each session card in the popup is named after the session's conversation title, the same title as its VS Code tab (for example *Dayforce Senior DevOps Engineer job page*). Under the title you see the project folder, where the session runs and whether Claude is busy or waiting for you. For sessions in VS Code, **Go to session ↗** focuses the VS Code window for that folder and shows the chat. The button is on the session card, and on the *This tab* box when a session controls the current tab. The server reads the title and status from Claude Code's own files under `~/.claude` (`sessions/<pid>.json` and the session transcript).
+
 ### Or just ask
 
 Just ask Claude, for example:

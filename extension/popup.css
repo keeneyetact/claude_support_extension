@@ -56,6 +56,16 @@ summary { cursor: pointer; font-weight: 600; }
 .state { flex: none; font-size: 12px; padding: 1px 8px; border-radius: 10px; border: 1px solid var(--border); color: var(--muted); }
 .state.working { color: #fff; background: var(--c, var(--accent)); border-color: transparent; animation: pulse 1.2s ease-in-out infinite; }
 @keyframes pulse { 50% { opacity: .65; } }
+.head-wrap { display: grid; gap: 2px; min-width: 0; }
+.sub-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
+.sub { font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+button.go {
+  flex: none; font-size: 11px; padding: 2px 8px; border-radius: 10px; cursor: pointer;
+  border: 1px solid var(--c, var(--accent)); color: var(--c, var(--accent)); background: transparent;
+}
+button.go:hover { background: var(--c, var(--accent)); color: #fff; }
+button.go:disabled { opacity: .7; cursor: default; }
+.sbtns { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; flex: none; }
 .card { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
 .tab {
   display: flex; gap: 8px; align-items: center; width: 100%; text-align: left;
