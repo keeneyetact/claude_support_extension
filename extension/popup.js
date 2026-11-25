@@ -111,6 +111,40 @@ function sessionCard(s) {
   return card;
 }
 
+/** One row per connected session, including ones without a tab, with its tab and details. */
+function sessionRow(s) {
+  const li = el('li', 'srow');
+  li.style.setProperty('--c', s.color);
+
+  const head = el('div', 'card-head');
+  const name = el('div', 'name');
+  name.append(el('span', 'chip', 'C' + s.number), el('span', '', s.label));
+  head.append(name);
+  const running = s.running[0];
+  head.append(el('span', 'state' + (running ? ' working' : ''),
+    running ? `${verb(running.method)}…` : s.tab ? 'has tab' : 'no tab'));
+  li.append(head);
+
+  if (s.tab) {
+    const b = el('button', 'tab');
+    b.title = 'Show this tab';
+    fillTabRow(b, s.tab);
+    b.addEventListener('click', () => send({ type: 'focusTab', tabId: s.tab.id }));
+    li.append(b);
+  }
+
+  const dl = el('dl', 'facts');
+  const fact = (k, v) => { if (v == null || v === '') return; dl.append(el('dt', '', k), el('dd', '', String(v))); };
+  if (s.tab) fact('Tab', `id ${s.tab.id} · window ${s.tab.windowId}${s.tab.active ? ' · active' : ''}`);
+  fact('Folder', s.cwd);
+  fact('Server', `port ${s.port}${s.pid ? ` · pid ${s.pid}` : ''}${s.serverVersion ? ` · v${s.serverVersion}` : ''}`);
+  fact('Connected', ago(s.connectedAt));
+  fact('Commands', `${s.commands || 0}${s.errors ? ` · ${s.errors} failed` : ''}${s.lastActionAt ? ` · last ${ago(s.lastActionAt)}` : ''}`);
+  if (running) fact('Running', `${verb(running.method)} ${describeParams(running.detail)} · ${ago(running.since)}`);
+  li.append(dl);
+  return li;
+}
+
 // ---------------------------------------------------------------- hand a tab to Claude
 
 // Pages no extension may control.
@@ -237,6 +271,10 @@ async function refresh() {
     const active = st.sessions.filter((s) => s.tab || s.running.length);
     box.replaceChildren(...active.map(sessionCard));
   }
+
+  $('sessionListBox').hidden = !st.settings.enabled || !n;
+  $('sessionCount').textContent = n ? `(${n})` : '';
+  $('sessionList').replaceChildren(...st.sessions.map(sessionRow));
 
   $('profileInfo').textContent = `Shown to Claude as "${st.label}"${st.email && st.email !== st.label ? ` (${st.email})` : ''} · id ${st.profileId.slice(0, 8)}` +
     (st.attachedTabs ? ` · debugger attached to ${st.attachedTabs} tab(s)` : '');

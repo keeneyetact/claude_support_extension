@@ -145,7 +145,7 @@ async function connect(port) {
     port, ws: null, state: 'probing', server: null, connectedAt: null, clientNonce: null, cancelled: false,
     // session context (see commands.js)
     number: 0, label: '', color: 'grey', badge: '', badgeColor: '#777', connected: false,
-    currentTabId: null, groups: new Map(), running: new Map(), activity: [], lastActionAt: null,
+    currentTabId: null, groups: new Map(), running: new Map(), activity: [], lastActionAt: null, commands: 0, errors: 0,
   };
   conns.set(port, c);
   const alive = await probe(port);
@@ -248,6 +248,7 @@ async function onMessage(c, msg) {
       const started = Date.now();
       c.running.set(msg.id, { method: msg.method, since: started, detail: brief(msg.params) });
       c.lastActionAt = started;
+      c.commands++;
       try {
         const result = await handleCommand(msg.method, msg.params, c);
         safeSend(c, { type: 'response', id: msg.id, result });
@@ -255,6 +256,7 @@ async function onMessage(c, msg) {
       } catch (e) {
         const message = e && e.message ? e.message : String(e);
         safeSend(c, { type: 'response', id: msg.id, error: { message } });
+        c.errors++;
         logActivity(c, { method: msg.method, ok: false, ms: Date.now() - started, detail: message.slice(0, 200), tabId: c.currentTabId });
       } finally {
         c.running.delete(msg.id);
@@ -374,6 +376,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             port: c.port,
             connectedAt: c.connectedAt,
             lastActionAt: c.lastActionAt,
+            commands: c.commands,
+            errors: c.errors,
+            serverVersion: c.server.version,
             running: [...c.running.values()],
             tab,
             activity: c.activity.slice(0, 8),
