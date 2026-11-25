@@ -23,6 +23,7 @@ const DOING = {
   screenshot: 'taking a screenshot', click: 'clicking', hover: 'hovering', drag: 'dragging', type: 'typing',
   press_key: 'pressing keys', select_option: 'choosing an option', scroll: 'scrolling', evaluate: 'running a script',
   wait_for: 'waiting', console_messages: 'reading the console', handle_dialog: 'answering a dialog', upload_file: 'uploading a file',
+  extension_reload: 'reloading an extension',
 };
 const SCAN_INTERVAL_MS = 3000;
 const PING_INTERVAL_MS = 20000;

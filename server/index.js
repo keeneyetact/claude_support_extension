@@ -506,6 +506,11 @@ browserTool('console_messages', 'Get console messages, uncaught exceptions and n
   tabId: tabIdArg,
 }, { annotations: RO });
 
+browserTool('extension_reload', 'Reload an unpacked (developer) Chrome extension from disk after its source changed, by name or id. Call without name/id to list the unpacked extensions. Tabs already injected keep the old content scripts until reloaded (navigate "reload").', {
+  name: z.string().optional().describe('Extension name or part of it (case-insensitive), e.g. "Auto-Bid".'),
+  id: z.string().optional().describe('Extension id (alternative to name).'),
+}, { timeout: 30000, annotations: ACT });
+
 // ------------------------------------------------------------------ start
 
 async function main() {

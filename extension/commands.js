@@ -726,6 +726,27 @@ const handlers = {
     return { text: `${accept ? 'Accepted' : 'Dismissed'} ${d.type} dialog "${d.message}".\n` + (await settle(tab.id, Date.now(), null)) };
   },
 
+  // Reload an UNPACKED extension from disk (turn it off and on), e.g. after
+  // its source was edited. Packed (store) extensions and this bridge itself
+  // are refused. Without name/id, lists the unpacked extensions.
+  async extension_reload({ name, id } = {}) {
+    if (!chrome.management) throw new Error('This bridge extension lacks the "management" permission — reload it on chrome://extensions once.');
+    const all = (await chrome.management.getAll()).filter((e) => e.type === 'extension' && e.id !== chrome.runtime.id);
+    const unpacked = all.filter((e) => e.installType === 'development');
+    const list = (arr) => arr.map((e) => `- ${e.name} v${e.version} (${e.id})${e.enabled ? '' : ' [disabled]'}`).join('\n') || '(none)';
+    if (!name && !id) return { text: `Unpacked extensions that can be reloaded:\n${list(unpacked)}` };
+    const want = String(name || '').toLowerCase();
+    const match = all.filter((e) => (id && e.id === id) || (!id && e.name.toLowerCase().includes(want)));
+    if (!match.length) throw new Error(`No extension matches ${id ? `id "${id}"` : `"${name}"`}. Unpacked extensions:\n${list(unpacked)}`);
+    if (match.length > 1) throw new Error(`Several extensions match "${name}" — pass id:\n${list(match)}`);
+    const ext = match[0];
+    if (ext.installType !== 'development') throw new Error(`"${ext.name}" is not an unpacked extension (${ext.installType}); only unpacked extensions are reloaded.`);
+    if (ext.enabled) await chrome.management.setEnabled(ext.id, false);
+    await chrome.management.setEnabled(ext.id, true);
+    const now = await chrome.management.get(ext.id);
+    return { text: `Reloaded "${now.name}" v${now.version} (${now.id}) from disk${now.enabled ? '' : ' — but it is now DISABLED (check chrome://extensions for errors)'}.\nTabs it already injected into still run the old content scripts: reload those tabs (navigate "reload") to use the new code.` };
+  },
+
   async upload_file({ tabId, ref, selector, paths } = {}, ctx) {
     const files = Array.isArray(paths) ? paths : paths ? [paths] : [];
     if (!files.length) throw new Error('paths (absolute file paths on this computer) is required.');

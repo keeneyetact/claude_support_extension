@@ -82,6 +82,7 @@ Just ask Claude, for example:
 | `wait_for` | Wait for text or a selector to appear or disappear, or for a set time |
 | `evaluate` | Run JavaScript in the page (bypasses CSP; supports `await` and `return`) |
 | `console_messages` | Console logs, errors and navigations captured on the tab |
+| `extension_reload` | Reload an unpacked extension from disk after editing it (lists unpacked extensions when no name is given). Needs the `management` permission |
 
 It also handles:
 * Same-origin iframes and open **and closed** shadow DOM, both in snapshots and for clicking.
