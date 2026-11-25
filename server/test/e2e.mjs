@@ -68,27 +68,38 @@ function check(name, cond, detail = '') {
 const text = (r) => (r.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('\n');
 const refOf = (snap, re) => { const m = new RegExp(re.source + '[^\\n]*?\\[ref=(e\\d+)\\]').exec(snap); return m && m[1]; };
 
-function loadExtensionViaPipe(proc, dir) {
-  return new Promise((resolve, reject) => {
-    const out = proc.stdio[4];
-    let buf = Buffer.alloc(0);
-    const t = setTimeout(() => reject(new Error('Timed out loading extension via CDP')), 20000);
-    out.on('data', (d) => {
-      buf = Buffer.concat([buf, d]);
-      let i;
-      while ((i = buf.indexOf(0)) !== -1) {
-        const msg = JSON.parse(buf.subarray(0, i).toString());
-        buf = buf.subarray(i + 1);
-        if (msg.id === 1) {
-          clearTimeout(t);
-          if (msg.error) reject(new Error('Extensions.loadUnpacked: ' + msg.error.message));
-          else resolve(msg.result.id);
-        }
-      }
-    });
-    proc.stdio[3].write(JSON.stringify({ id: 1, method: 'Extensions.loadUnpacked', params: { path: dir } }) + '\0');
+// Minimal CDP client over Chrome's --remote-debugging-pipe (fd 3 = to Chrome, fd 4 = from Chrome).
+function cdpPipe(proc) {
+  let id = 0;
+  let buf = Buffer.alloc(0);
+  const pending = new Map();
+  proc.stdio[4].on('data', (d) => {
+    buf = Buffer.concat([buf, d]);
+    let i;
+    while ((i = buf.indexOf(0)) !== -1) {
+      const msg = JSON.parse(buf.subarray(0, i).toString());
+      buf = buf.subarray(i + 1);
+      const p = msg.id && pending.get(msg.id);
+      if (p) { pending.delete(msg.id); msg.error ? p.reject(new Error(`${p.method}: ${msg.error.message}`)) : p.resolve(msg.result); }
+    }
   });
+  const send = (method, params = {}, sessionId) => new Promise((resolve, reject) => {
+    const i = ++id;
+    pending.set(i, { resolve, reject, method });
+    proc.stdio[3].write(JSON.stringify({ id: i, method, params, sessionId }) + '\0');
+  });
+  const evaluate = async (sessionId, expression) => {
+    const r = await send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, sessionId);
+    if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text);
+    return r.result.value;
+  };
+  return { send, evaluate };
 }
+
+// Test-only port range, so the user's real Chrome profiles (which scan the default range) never join.
+const TEST_PORT_START = 28765;
+const TEST_PORT_COUNT = 3;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function main() {
   const site = http.createServer((req, res) => {
@@ -111,13 +122,29 @@ async function main() {
   ];
   // fds 3/4 are the CDP pipe (Chrome reads commands from fd 3, writes to fd 4)
   const chrome = spawn(chromePath, chromeArgs, { stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'] });
-  const loaded = await loadExtensionViaPipe(chrome, extPath);
-  console.log('extension loaded:', loaded);
+  const browser = cdpPipe(chrome);
+  const extId = (await browser.send('Extensions.loadUnpacked', { path: extPath })).id;
+  console.log('extension loaded:', extId);
+  // chrome://extensions page: turn on developer mode (enables error collection) and read errors later.
+  const { targetId: extPageId } = await browser.send('Target.createTarget', { url: 'chrome://extensions' });
+  const extPage = (await browser.send('Target.attachToTarget', { targetId: extPageId, flatten: true })).sessionId;
+  await sleep(1000);
+  await browser.evaluate(extPage, 'chrome.developerPrivate.updateProfileConfiguration({ inDeveloperMode: true })');
+  // Point the test extension at the test port range.
+  let swTarget;
+  for (let i = 0; i < 50 && !swTarget; i++) {
+    swTarget = (await browser.send('Target.getTargets')).targetInfos.find((t) => t.type === 'service_worker' && t.url.includes(extId));
+    if (!swTarget) await sleep(100);
+  }
+  const sw = (await browser.send('Target.attachToTarget', { targetId: swTarget.targetId, flatten: true })).sessionId;
+  await browser.evaluate(sw, `chrome.storage.local.set({ settings: { enabled: true, profileLabel: 'E2E', token: '', portStart: ${TEST_PORT_START}, portCount: ${TEST_PORT_COUNT} } })`);
+  const extensionErrors = () => browser.evaluate(extPage, `chrome.developerPrivate.getExtensionInfo(${JSON.stringify(extId)})
+    .then((i) => [...i.runtimeErrors, ...i.manifestErrors].map((e) => (e.severity || 'MANIFEST') + ': ' + e.message + ' x' + (e.occurrences || 1)))`);
 
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [serverPath],
-    env: { ...process.env, CHROME_BRIDGE_CONNECT_WAIT_MS: '30000' },
+    env: { ...process.env, CHROME_BRIDGE_CONNECT_WAIT_MS: '30000', CHROME_BRIDGE_PORT_START: String(TEST_PORT_START), CHROME_BRIDGE_PORT_COUNT: String(TEST_PORT_COUNT) },
     stderr: 'pipe',
   });
   transport.stderr?.on('data', (d) => process.env.VERBOSE && process.stderr.write(d));
@@ -282,6 +309,12 @@ async function main() {
     r = await call('navigate', { url: 'chrome://settings' });
     r = await call('snapshot');
     check('restricted page error', r.isError && /does not allow/.test(text(r)), text(r));
+
+    // The Claude session ends: the server goes away while the extension keeps scanning for sessions.
+    await client.close().catch(() => {});
+    await sleep(8000);
+    const errs = await extensionErrors();
+    check('extension Errors page stays empty (incl. idle scanning after the session ended)', errs.length === 0, errs.join('\n'));
   } finally {
     console.log(results.join('\n'));
     console.log(`\n${results.length - failures}/${results.length} checks passed`);

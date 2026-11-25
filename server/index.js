@@ -52,6 +52,13 @@ class Bridge {
   listenOn(port) {
     return new Promise((resolve, reject) => {
       const server = http.createServer((req, res) => {
+        // Discovery probe used by the extension before it opens a WebSocket (a failed WebSocket
+        // handshake is logged by Chrome as an extension error; a failed fetch is not).
+        if (req.method === 'GET' && req.url === '/claude-bridge/info') {
+          res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+          res.end(JSON.stringify({ name: 'claude-browser-bridge', protocol: PROTOCOL_VERSION }));
+          return;
+        }
         res.writeHead(426, { 'content-type': 'text/plain' });
         res.end('Claude Browser Bridge: WebSocket endpoint for the Chrome extension.\n');
       });

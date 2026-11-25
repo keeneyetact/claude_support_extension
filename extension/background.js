@@ -43,7 +43,7 @@ function init() {
       updateBadge();
       scan();
     })().catch((e) => {
-      console.error('[claude-bridge] init failed', e);
+      logActivity({ method: 'init-failed', ok: false, detail: String(e && e.message || e) });
       initPromise = null;
     });
   }
@@ -96,13 +96,46 @@ function ports() {
 function scan() {
   if (!settings.enabled || !profileId) return;
   const wanted = new Set(ports());
-  for (const [port, c] of conns) if (!wanted.has(port)) { try { c.ws.close(); } catch (_) { /* ignore */ } conns.delete(port); }
+  for (const [port, c] of conns) if (!wanted.has(port)) { closeConn(c, 'port range changed'); conns.delete(port); }
   for (const port of wanted) if (!conns.has(port)) connect(port);
 }
 
-function connect(port) {
-  const c = { port, ws: null, state: 'connecting', server: null, connectedAt: null, clientNonce: null };
+// Close without triggering Chrome's "WebSocket is closed before the connection is established" error.
+function closeConn(c, reason) {
+  c.cancelled = true;
+  const ws = c.ws;
+  if (!ws) return;
+  try {
+    if (ws.readyState === WebSocket.CONNECTING) ws.onopen = () => { try { ws.close(1000, reason); } catch (_) { /* ignore */ } };
+    else if (ws.readyState === WebSocket.OPEN) ws.close(1000, reason);
+  } catch (_) { /* ignore */ }
+}
+
+// Is a bridge server listening on this port? Uses fetch because a refused fetch fails silently,
+// whereas a refused WebSocket handshake is reported by Chrome as an extension error.
+async function probe(port) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 1500);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/claude-bridge/info`, { cache: 'no-store', signal: ctrl.signal, credentials: 'omit' });
+    if (!res.ok) return false;
+    const info = await res.json();
+    return info && info.name === 'claude-browser-bridge';
+  } catch (_) {
+    return false;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function connect(port) {
+  const c = { port, ws: null, state: 'probing', server: null, connectedAt: null, clientNonce: null, cancelled: false };
   conns.set(port, c);
+  const alive = await probe(port);
+  if (!alive || c.cancelled || conns.get(port) !== c || !settings.enabled) {
+    if (conns.get(port) === c) conns.delete(port);
+    return;
+  }
   let ws;
   try {
     ws = new WebSocket(`ws://127.0.0.1:${port}/claude-bridge`);
@@ -111,12 +144,13 @@ function connect(port) {
     return;
   }
   c.ws = ws;
-  const handshakeTimer = setTimeout(() => { if (c.state !== 'open') try { ws.close(); } catch (_) { /* ignore */ } }, 8000);
+  c.state = 'connecting';
+  const handshakeTimer = setTimeout(() => { if (c.state !== 'open') closeConn(c, 'handshake timeout'); }, 8000);
   ws.onopen = () => { c.state = 'handshake'; };
   ws.onmessage = (ev) => {
     let msg;
     try { msg = JSON.parse(ev.data); } catch (_) { return; }
-    onMessage(c, msg).catch((e) => console.warn('[claude-bridge] message error', e));
+    onMessage(c, msg).catch((e) => logActivity({ method: 'internal-error', ok: false, detail: String(e && e.message || e) }));
   };
   ws.onclose = () => {
     clearTimeout(handshakeTimer);
@@ -124,11 +158,11 @@ function connect(port) {
     if (c.state === 'open') logActivity({ method: 'disconnected', ok: true, detail: serverLabel(c) });
     updateBadge();
   };
-  ws.onerror = () => { /* onclose follows; connection refused is normal when no server listens on this port */ };
+  ws.onerror = () => { /* onclose follows */ };
 }
 
 function closeAll(reason) {
-  for (const c of conns.values()) { try { c.ws.close(1000, reason); } catch (_) { /* ignore */ } }
+  for (const c of conns.values()) closeConn(c, reason);
   conns.clear();
   updateBadge();
 }
@@ -137,7 +171,7 @@ function safeSend(c, obj) {
   try {
     if (c.ws && c.ws.readyState === WebSocket.OPEN) c.ws.send(JSON.stringify(obj));
   } catch (e) {
-    console.warn('[claude-bridge] send failed', e);
+    logActivity({ method: 'send-failed', ok: false, detail: String(e && e.message || e) });
   }
 }
 
@@ -178,7 +212,7 @@ async function onMessage(c, msg) {
       if (settings.token) {
         const expected = await hmac(settings.token, 'server:' + c.clientNonce);
         if (msg.proof !== expected) {
-          console.warn(`[claude-bridge] server on port ${c.port} failed token verification; disconnecting`);
+          logActivity({ method: 'token-mismatch', ok: false, detail: `Server on port ${c.port} does not know the shared token; disconnected.` });
           try { c.ws.close(4003, 'server token mismatch'); } catch (_) { /* ignore */ }
           return;
         }
@@ -205,7 +239,6 @@ async function onMessage(c, msg) {
       break;
     }
     case 'error':
-      console.warn(`[claude-bridge] server on port ${c.port}: ${msg.message}`);
       logActivity({ method: 'server-error', ok: false, detail: msg.message });
       break;
     case 'pong':
