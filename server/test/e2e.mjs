@@ -179,6 +179,8 @@ async function main() {
     check('snapshot sees same-origin iframe', /button "Frame button"/.test(snap), snap);
     check('snapshot sees closed shadow root', /button "Shadow button"/.test(snap), snap);
     check('snapshot sees clickable div', /clickable "Clickable card"/.test(snap), snap);
+    check('controlled tab shows the on-page Claude indicator', text(await call('evaluate', { expression: '!!document.querySelector("claude-bridge-indicator")' })) === 'true');
+    check('indicator is left out of snapshots', !/Claude C\d/.test(snap), snap);
 
     const nameRef = refOf(snap, /textbox "Your name"/);
     const greetRef = refOf(snap, /button "Greet"/);
@@ -365,10 +367,16 @@ async function main() {
 
     r = await callB('tab_select', { tabId: Number(testTab), takeOver: true });
     check('takeOver lets a session take a tab when asked', !r.isError, text(r));
+    const hasIndicator = (tabId) => browser.evaluate(popup, `chrome.scripting.executeScript({ target: { tabId: ${tabId} }, func: () => !!document.querySelector('claude-bridge-indicator') }).then(([r]) => r.result)`);
+    check('indicator leaves a tab its session switched away from', (await hasIndicator(tabB)) === false);
+    await callB('tab_select', { tabId: tabB });
+    await sleep(300);
+    check('indicator shows on the tab a session switches to', (await hasIndicator(tabB)) === true);
     await clientB.close();
     await sleep(500);
     const groupsAfter = await browser.evaluate(popup, `chrome.tabGroups.query({}).then((g) => g.map((x) => x.title))`);
     check('ended session\'s group is marked ended', groupsAfter.some((t) => /second-project \(ended\)/.test(t)), JSON.stringify(groupsAfter));
+    check('indicator disappears when the controlling session ends', (await hasIndicator(tabB)) === false);
 
     // The Claude session ends: the server goes away while the extension keeps scanning for sessions.
     await client.close().catch(() => {});

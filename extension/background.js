@@ -1,5 +1,5 @@
 // Service worker: maintains WebSocket connections to local Claude bridge servers and runs their commands.
-import { handleCommand, releaseSession, configure } from './commands.js';
+import { handleCommand, releaseSession, configure, ownerOf } from './commands.js';
 import { detachAll, attachedTabIds } from './cdp.js';
 
 const PROTOCOL_VERSION = 1;
@@ -349,13 +349,14 @@ function updateBadge() {
   chrome.action.setBadgeText({ text: n ? String(n) : '' });
   chrome.action.setBadgeBackgroundColor({ color: '#2e7d32' });
   chrome.action.setTitle({
-    title: n ? `Claude Browser Bridge — ${n} Claude session(s) connected` : 'Claude Browser Bridge — waiting for a Claude session',
+    // Tabs a session controls override this with their own badge (C1, C2…) and title.
+    title: n ? `Claude Browser Bridge — ${n} Claude session(s) connected · this tab is not controlled by Claude` : 'Claude Browser Bridge — waiting for a Claude session',
   });
 }
 
 // ------------------------------------------------------------------ popup API
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     await init();
     switch (msg && msg.type) {
@@ -395,6 +396,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           attachedTabs: attachedTabIds().length,
           activity,
         };
+      }
+      case 'indicatorState': {
+        // Asked by content/indicator.js: who controls the tab this page is in?
+        const c = settings.enabled && sender.tab ? ownerOf(sender.tab.id) : null;
+        if (!c || !c.connected) return { owner: null };
+        const running = c.running.values().next().value;
+        return { owner: { number: c.number, label: c.label, color: c.badgeColor, working: running ? running.method.replace(/_/g, ' ') : '' } };
       }
       case 'focusTab': {
         const t = await chrome.tabs.update(Number(msg.tabId), { active: true });

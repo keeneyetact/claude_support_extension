@@ -97,6 +97,7 @@ You can run several Claude sessions at once, each driving a different tab:
 * A tab can be controlled by only **one session at a time**. If session B tries to use session A's tab, it gets an error and is told to open its own with `tab_new`. It can take the tab over (`tab_select` with `takeOver: true`) only when you ask it to.
 * Tabs a session opens go into a **coloured tab group** named `Claude · <project>`. When the session ends, the group is greyed out and marked *(ended)*. You can turn grouping off in Settings.
 * On a tab that a session controls, the toolbar icon shows that session's badge (`C1`, `C2`, …) in its colour.
+* The page itself gets a thin frame in the session's colour and a small `Claude C1 · <project>` label in the bottom-left corner, which also shows the command that is running. It ignores the mouse, is hidden while Claude takes screenshots, and is left out of snapshots. It disappears as soon as the tab is released or the session ends. If a tab has no frame, no Claude session is controlling it.
 
 ### Watching what Claude is doing
 

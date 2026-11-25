@@ -1,7 +1,7 @@
 // In-page helper injected into the extension's ISOLATED world (never visible to the page's own scripts).
 // Idempotent: re-injecting only replaces it when the version changes.
 (() => {
-  const VERSION = 5;
+  const VERSION = 6;
   if (window.__claudeBridge && window.__claudeBridge.version === VERSION) return;
 
   // ---------------------------------------------------------------- element refs
@@ -186,7 +186,7 @@
     'link', 'button', 'tab', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'option', 'treeitem', 'heading',
     'clickable', 'gridcell-clickable', 'checkbox', 'radio', 'switch',
   ]);
-  const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'META', 'LINK', 'HEAD', 'TITLE', 'BASE']);
+  const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'META', 'LINK', 'HEAD', 'TITLE', 'BASE', 'CLAUDE-BRIDGE-INDICATOR']);
   const BLOCK_DISPLAY = /^(block|flex|grid|list-item|table|table-row|table-cell|flow-root|table-caption)/;
 
   function implicitRole(el) {

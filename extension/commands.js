@@ -4,7 +4,7 @@ import {
 } from './cdp.js';
 import { keyDef, parseCombo, modifierBits, macCommands } from './keys.js';
 
-const AGENT_VERSION = 5; // must match VERSION in content/agent.js
+const AGENT_VERSION = 6; // must match VERSION in content/agent.js
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 let isMac = false;
@@ -39,12 +39,38 @@ function clearTabBadge(tabId) {
   chrome.action.setTitle({ tabId, title: 'Claude Browser Bridge' }).catch(() => {});
 }
 
+// ------------------------------------------------------------------ on-page "controlled by Claude" marker
+
+/** Inject (or refresh) content/indicator.js; it polls the background for who controls the tab. */
+function showIndicator(tabId) {
+  chrome.scripting.executeScript({ target: { tabId }, world: 'ISOLATED', files: ['content/indicator.js'] }).catch(() => {});
+}
+
+function removeIndicator(tabId) {
+  chrome.scripting.executeScript({
+    target: { tabId }, world: 'ISOLATED', func: () => window.__claudeBridgeIndicator?.remove(),
+  }).catch(() => {});
+}
+
+/** Hide the marker so it does not show up in screenshots. */
+async function setIndicatorHidden(tabId, hidden) {
+  await withTimeout(chrome.scripting.executeScript({
+    target: { tabId }, world: 'ISOLATED', func: (h) => window.__claudeBridgeIndicator?.setHidden(h), args: [hidden],
+  }), 1000, 'indicator').catch(() => {});
+}
+
+// A navigation wipes the page, so re-add the marker once the new page has loaded.
+chrome.tabs.onUpdated.addListener((tabId, info) => {
+  if (info.status === 'complete' && tabOwner.has(tabId)) showIndicator(tabId);
+});
+
 function setAgentTab(ctx, tabId) {
   if (ctx.currentTabId === tabId) return;
   const old = ctx.currentTabId;
   if (old != null && tabOwner.get(old) === ctx) {
     tabOwner.delete(old);
     clearTabBadge(old);
+    removeIndicator(old);
   }
   ctx.currentTabId = tabId;
   if (tabId != null) {
@@ -55,6 +81,7 @@ function setAgentTab(ctx, tabId) {
     }
     tabOwner.set(tabId, ctx);
     setTabBadge(tabId, ctx);
+    showIndicator(tabId);
   }
   if (ctx.onChange) ctx.onChange();
 }
@@ -424,6 +451,7 @@ const handlers = {
 
     let shot;
     const capture = (ms) => cdp(tab.id, 'Page.captureScreenshot', params, ms);
+    await setIndicatorHidden(tab.id, true);
     try {
       shot = await capture(tab.active ? 20000 : 3000);
     } catch (e) {
@@ -437,6 +465,8 @@ const handlers = {
       } finally {
         if (prev && prev.id !== tab.id) await chrome.tabs.update(prev.id, { active: true }).catch(() => {});
       }
+    } finally {
+      setIndicatorHidden(tab.id, false);
     }
 
     const longest = Math.max(cssW, cssH);
