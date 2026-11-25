@@ -7,12 +7,81 @@ import { keyDef, parseCombo, modifierBits, macCommands } from './keys.js';
 const AGENT_VERSION = 5; // must match VERSION in content/agent.js
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-let currentTabId = null;
 let isMac = false;
 chrome.runtime.getPlatformInfo().then((p) => { isMac = p.os === 'mac'; }).catch(() => {});
 
-export function getCurrentTabId() {
-  return currentTabId;
+// ------------------------------------------------------------------ sessions & tab ownership
+// Every connected Claude session has a context object (created by background.js):
+//   { label, color, badge, badgeColor, connected, currentTabId, groups: Map<windowId, groupId>, onChange? }
+// Each session works in its own "agent tab"; a tab can be controlled by only one session at a time.
+
+/** tabId -> session ctx that currently controls it */
+const tabOwner = new Map();
+let options = { groupTabs: true };
+
+export function configure(o) {
+  options = { ...options, ...o };
+}
+
+export function ownerOf(tabId) {
+  return tabOwner.get(tabId) || null;
+}
+
+function setTabBadge(tabId, ctx) {
+  chrome.action.setBadgeText({ tabId, text: ctx.badge }).catch(() => {});
+  chrome.action.setBadgeBackgroundColor({ tabId, color: ctx.badgeColor }).catch(() => {});
+  chrome.action.setTitle({ tabId, title: `This tab is controlled by Claude session "${ctx.label}"` }).catch(() => {});
+}
+
+function clearTabBadge(tabId) {
+  // null resets the tab-specific value back to the global one
+  chrome.action.setBadgeText({ tabId, text: null }).catch(() => chrome.action.setBadgeText({ tabId, text: '' }).catch(() => {}));
+  chrome.action.setTitle({ tabId, title: 'Claude Browser Bridge' }).catch(() => {});
+}
+
+function setAgentTab(ctx, tabId) {
+  if (ctx.currentTabId === tabId) return;
+  const old = ctx.currentTabId;
+  if (old != null && tabOwner.get(old) === ctx) {
+    tabOwner.delete(old);
+    clearTabBadge(old);
+  }
+  ctx.currentTabId = tabId;
+  if (tabId != null) {
+    const prev = tabOwner.get(tabId);
+    if (prev && prev !== ctx) {
+      prev.currentTabId = null;
+      if (prev.onChange) prev.onChange();
+    }
+    tabOwner.set(tabId, ctx);
+    setTabBadge(tabId, ctx);
+  }
+  if (ctx.onChange) ctx.onChange();
+}
+
+/** Called when a session disconnects: its tab becomes free again. */
+export function releaseSession(ctx) {
+  ctx.connected = false;
+  setAgentTab(ctx, null);
+}
+
+// Put tabs a session opens into a coloured tab group named after the session.
+async function groupTab(ctx, tab) {
+  if (!options.groupTabs || !chrome.tabGroups) return;
+  try {
+    let gid = ctx.groups.get(tab.windowId);
+    if (gid != null) {
+      try { await chrome.tabGroups.get(gid); } catch (_) { gid = null; }
+    }
+    gid = await chrome.tabs.group(gid != null ? { tabIds: tab.id, groupId: gid } : { tabIds: tab.id, createProperties: { windowId: tab.windowId } });
+    ctx.groups.set(tab.windowId, gid);
+    await chrome.tabGroups.update(gid, { title: `Claude · ${ctx.label}`, color: ctx.color, collapsed: false });
+  } catch (_) { /* e.g. popup windows can't hold groups */ }
+}
+
+function otherOwner(ctx, tabId) {
+  const o = tabOwner.get(tabId);
+  return o && o !== ctx && o.connected ? o : null;
 }
 
 // Track tabs opened by pages (target=_blank, window.open) so actions can report them.
@@ -22,7 +91,12 @@ chrome.tabs.onCreated.addListener((t) => {
   while (recentCreated.length && Date.now() - recentCreated[0].at > 120000) recentCreated.shift();
 });
 chrome.tabs.onRemoved.addListener((tabId) => {
-  if (tabId === currentTabId) currentTabId = null;
+  const owner = tabOwner.get(tabId);
+  if (owner) {
+    tabOwner.delete(tabId);
+    if (owner.currentTabId === tabId) owner.currentTabId = null;
+    if (owner.onChange) owner.onChange();
+  }
   refCounters.delete(tabId);
 });
 
@@ -61,22 +135,33 @@ function guardDialog(tabId) {
   if (st && st.dialog) throw dialogError(st.dialog);
 }
 
-async function resolveTab(tabId) {
+async function resolveTab(ctx, tabId, { takeOver = false } = {}) {
   if (tabId != null) {
     let tab;
     try { tab = await chrome.tabs.get(Number(tabId)); } catch (_) {
       throw new Error(`Tab ${tabId} does not exist. Call tabs_list to see open tabs.`);
     }
-    currentTabId = tab.id;
+    const o = otherOwner(ctx, tab.id);
+    if (o && !takeOver) {
+      throw new Error(
+        `Tab ${tab.id} is being controlled by another Claude session ("${o.label}"). ` +
+        'Open your own tab with tab_new, or call tab_select with takeOver: true only if the user asked you to take that tab over.',
+      );
+    }
+    setAgentTab(ctx, tab.id);
     return tab;
   }
-  if (currentTabId != null) {
-    try { return await chrome.tabs.get(currentTabId); } catch (_) { currentTabId = null; }
+  if (ctx.currentTabId != null) {
+    try { return await chrome.tabs.get(ctx.currentTabId); } catch (_) { setAgentTab(ctx, null); }
   }
   let [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   if (!tab) [tab] = await chrome.tabs.query({ active: true });
   if (!tab) throw new Error('No open tab found. Use tab_new to open one.');
-  currentTabId = tab.id;
+  const o = otherOwner(ctx, tab.id);
+  if (o) {
+    throw new Error(`This session has no tab yet, and the active tab is being controlled by another Claude session ("${o.label}"). Use tab_new to open your own tab (or tabs_list + tab_select).`);
+  }
+  setAgentTab(ctx, tab.id);
   return tab;
 }
 
@@ -218,7 +303,7 @@ async function resizeImage(b64, inMime, width, height, outMime, quality) {
 // ------------------------------------------------------------------ handlers
 
 const handlers = {
-  async tabs_list() {
+  async tabs_list(_params, ctx) {
     const windows = await chrome.windows.getAll({ populate: true });
     const lines = [];
     for (const w of windows) {
@@ -226,7 +311,8 @@ const handlers = {
       for (const t of w.tabs || []) {
         const flags = [];
         if (t.active) flags.push('active');
-        if (t.id === currentTabId) flags.push('AGENT TAB');
+        if (t.id === ctx.currentTabId) flags.push('YOUR AGENT TAB');
+        else if (otherOwner(ctx, t.id)) flags.push(`controlled by other Claude session "${otherOwner(ctx, t.id).label}"`);
         if (t.status === 'loading') flags.push('loading');
         if (t.pinned) flags.push('pinned');
         if (t.audible) flags.push('audible');
@@ -234,11 +320,11 @@ const handlers = {
         lines.push(`  ${summary(t)}${flags.length ? '  {' + flags.join(', ') + '}' : ''}`);
       }
     }
-    lines.push('', 'Commands without tabId act on the AGENT TAB (the last tab you used/selected; initially the active tab).');
+    lines.push('', 'Commands without tabId act on YOUR AGENT TAB (the last tab you opened/selected/used; initially the active tab). Tabs controlled by other Claude sessions are off-limits.');
     return { text: lines.join('\n') };
   },
 
-  async tab_new({ url, active = true, newWindow = false } = {}) {
+  async tab_new({ url, active = true, newWindow = false } = {}, ctx) {
     const target = url ? normalizeUrl(url) : 'about:blank';
     let tab;
     if (newWindow) {
@@ -247,7 +333,8 @@ const handlers = {
     } else {
       tab = await chrome.tabs.create({ url: target, active });
     }
-    currentTabId = tab.id;
+    setAgentTab(ctx, tab.id);
+    await groupTab(ctx, tab);
     let note = '';
     if (url) {
       const r = await waitForLoad(tab.id, 30000);
@@ -257,24 +344,24 @@ const handlers = {
     return { text: `Opened ${summary(tab)}. It is now the agent tab.${note}` };
   },
 
-  async tab_select({ tabId, activate = true, focusWindow = false } = {}) {
+  async tab_select({ tabId, activate = true, focusWindow = false, takeOver = false } = {}, ctx) {
     if (tabId == null) throw new Error('tabId is required (see tabs_list).');
-    const tab = await resolveTab(tabId);
+    const tab = await resolveTab(ctx, tabId, { takeOver });
     if (activate) await chrome.tabs.update(tab.id, { active: true });
     if (focusWindow) await chrome.windows.update(tab.windowId, { focused: true });
     return { text: `Agent tab is now ${summary(tab)}${activate ? ' (activated)' : ''}.` };
   },
 
-  async tab_close({ tabId } = {}) {
-    const tab = await resolveTab(tabId);
+  async tab_close({ tabId } = {}, ctx) {
+    const tab = await resolveTab(ctx, tabId);
     await chrome.tabs.remove(tab.id);
-    if (currentTabId === tab.id) currentTabId = null;
+    if (ctx.currentTabId === tab.id) setAgentTab(ctx, null);
     return { text: `Closed ${summary(tab)}.` };
   },
 
-  async navigate({ url, tabId, timeoutMs = 30000 } = {}) {
+  async navigate({ url, tabId, timeoutMs = 30000 } = {}, ctx) {
     if (!url) throw new Error('url is required (or "back", "forward", "reload").');
-    let tab = await resolveTab(tabId);
+    let tab = await resolveTab(ctx, tabId);
     guardDialog(tab.id);
     const since = Date.now();
     const cmd = String(url).toLowerCase();
@@ -300,8 +387,8 @@ const handlers = {
     return { text: `Loaded ${summary(tab)}${notes.length ? '\n' + notes.join('\n') : ''}` };
   },
 
-  async screenshot({ tabId, format = 'jpeg', quality = 80, fullPage = false, ref, selector, maxDimension = 1568 } = {}) {
-    let tab = await resolveTab(tabId);
+  async screenshot({ tabId, format = 'jpeg', quality = 80, fullPage = false, ref, selector, maxDimension = 1568 } = {}, ctx) {
+    let tab = await resolveTab(ctx, tabId);
     checkScriptable(tab);
     guardDialog(tab.id);
     await ensureAttached(tab.id);
@@ -370,24 +457,24 @@ const handlers = {
     };
   },
 
-  async snapshot({ tabId, interactiveOnly = false, viewportOnly = false, maxChars = 25000, ref, selector } = {}) {
-    const tab = await resolveTab(tabId);
+  async snapshot({ tabId, interactiveOnly = false, viewportOnly = false, maxChars = 25000, ref, selector } = {}, ctx) {
+    const tab = await resolveTab(ctx, tabId);
     const text = await page(tab, 'snapshot', { interactiveOnly, viewportOnly, maxChars, ref, selector }, 30000);
     return { text: `[tab ${tab.id}] ` + text };
   },
 
-  async find({ query, tabId, limit = 20 } = {}) {
-    const tab = await resolveTab(tabId);
+  async find({ query, tabId, limit = 20 } = {}, ctx) {
+    const tab = await resolveTab(ctx, tabId);
     return { text: await page(tab, 'find', { query, limit }, 30000) };
   },
 
-  async get_text({ tabId, ref, selector, offset = 0, maxChars = 20000 } = {}) {
-    const tab = await resolveTab(tabId);
+  async get_text({ tabId, ref, selector, offset = 0, maxChars = 20000 } = {}, ctx) {
+    const tab = await resolveTab(ctx, tabId);
     return { text: await page(tab, 'getText', { ref, selector, offset, maxChars }, 30000) };
   },
 
-  async click({ tabId, ref, selector, x, y, button = 'left', doubleClick = false, clickCount, modifiers = [] } = {}) {
-    const tab = await resolveTab(tabId);
+  async click({ tabId, ref, selector, x, y, button = 'left', doubleClick = false, clickCount, modifiers = [] } = {}, ctx) {
+    const tab = await resolveTab(ctx, tabId);
     checkScriptable(tab);
     guardDialog(tab.id);
     const since = Date.now();
@@ -403,8 +490,8 @@ const handlers = {
     };
   },
 
-  async hover({ tabId, ref, selector, x, y } = {}) {
-    const tab = await resolveTab(tabId);
+  async hover({ tabId, ref, selector, x, y } = {}, ctx) {
+    const tab = await resolveTab(ctx, tabId);
     checkScriptable(tab);
     guardDialog(tab.id);
     const pt = await targetPoint(tab, { ref, selector, x, y });
@@ -413,8 +500,8 @@ const handlers = {
     return { text: `Hovering over ${pt.description} at (${Math.round(pt.x)}, ${Math.round(pt.y)}).${pt.warning ? '\nWarning: ' + pt.warning : ''}` };
   },
 
-  async drag({ tabId, fromRef, fromSelector, fromX, fromY, toRef, toSelector, toX, toY } = {}) {
-    const tab = await resolveTab(tabId);
+  async drag({ tabId, fromRef, fromSelector, fromX, fromY, toRef, toSelector, toX, toY } = {}, ctx) {
+    const tab = await resolveTab(ctx, tabId);
     checkScriptable(tab);
     guardDialog(tab.id);
     const since = Date.now();
@@ -428,9 +515,9 @@ const handlers = {
     return { text: `Dragged ${a.description} to ${b.description}.\n` + (await settle(tab.id, since, urlBefore)) };
   },
 
-  async type({ tabId, text, ref, selector, clear = false, submit = false, slowly = false } = {}) {
+  async type({ tabId, text, ref, selector, clear = false, submit = false, slowly = false } = {}, ctx) {
     if (typeof text !== 'string') throw new Error('text is required.');
-    const tab = await resolveTab(tabId);
+    const tab = await resolveTab(ctx, tabId);
     checkScriptable(tab);
     guardDialog(tab.id);
     const since = Date.now();
@@ -474,9 +561,9 @@ const handlers = {
     return { text: `Typed ${text.length} character(s) into ${desc}${submit ? ' and pressed Enter' : ''}.\n${after}` };
   },
 
-  async press_key({ tabId, keys, repeat = 1 } = {}) {
+  async press_key({ tabId, keys, repeat = 1 } = {}, ctx) {
     if (!keys) throw new Error('keys is required, e.g. "Enter", "Escape", "Control+A", "Shift+Tab".');
-    const tab = await resolveTab(tabId);
+    const tab = await resolveTab(ctx, tabId);
     checkScriptable(tab);
     guardDialog(tab.id);
     const since = Date.now();
@@ -488,16 +575,16 @@ const handlers = {
     return { text: `Pressed ${list.join(', ')}${repeat > 1 ? ` x${repeat}` : ''}.\n` + (await settle(tab.id, since, urlBefore)) };
   },
 
-  async select_option({ tabId, ref, selector, values } = {}) {
-    const tab = await resolveTab(tabId);
+  async select_option({ tabId, ref, selector, values } = {}, ctx) {
+    const tab = await resolveTab(ctx, tabId);
     const since = Date.now();
     const urlBefore = tabUrl(tab);
     const selected = await page(tab, 'selectOption', { ref, selector, values });
     return { text: `Selected: ${selected.join(', ')}\n` + (await settle(tab.id, since, urlBefore)) };
   },
 
-  async scroll({ tabId, deltaX, deltaY, ref, selector, x, y } = {}) {
-    const tab = await resolveTab(tabId);
+  async scroll({ tabId, deltaX, deltaY, ref, selector, x, y } = {}, ctx) {
+    const tab = await resolveTab(ctx, tabId);
     checkScriptable(tab);
     guardDialog(tab.id);
     if ((ref || selector) && deltaX == null && deltaY == null) {
@@ -525,9 +612,9 @@ const handlers = {
     return { text };
   },
 
-  async evaluate({ tabId, expression, timeoutMs = 30000 } = {}) {
+  async evaluate({ tabId, expression, timeoutMs = 30000 } = {}, ctx) {
     if (!expression) throw new Error('expression is required.');
-    const tab = await resolveTab(tabId);
+    const tab = await resolveTab(ctx, tabId);
     checkScriptable(tab);
     guardDialog(tab.id);
     // replMode allows top-level await but does not await a returned promise, so wrapped code runs without it.
@@ -552,13 +639,13 @@ const handlers = {
     return { text: out };
   },
 
-  async wait_for({ tabId, text, textGone, selector, selectorGone, time, timeoutMs = 15000 } = {}) {
+  async wait_for({ tabId, text, textGone, selector, selectorGone, time, timeoutMs = 15000 } = {}, ctx) {
     if (text == null && textGone == null && selector == null && selectorGone == null) {
       const ms = Math.max(0, Math.min(Number(time ?? 1000), 60000));
       await sleep(ms);
       return { text: `Waited ${ms} ms.` };
     }
-    const tab = await resolveTab(tabId);
+    const tab = await resolveTab(ctx, tabId);
     const start = Date.now();
     let lastErr = null;
     while (Date.now() - start < timeoutMs) {
@@ -577,8 +664,8 @@ const handlers = {
     throw new Error(`Timed out after ${timeoutMs} ms waiting for ${JSON.stringify({ text, textGone, selector, selectorGone })}.${lastErr ? ' Last error: ' + lastErr.message : ''}`);
   },
 
-  async console_messages({ tabId, level, clear = false, limit = 100 } = {}) {
-    const tab = await resolveTab(tabId);
+  async console_messages({ tabId, level, clear = false, limit = 100 } = {}, ctx) {
+    const tab = await resolveTab(ctx, tabId);
     const existed = !!sessionFor(tab.id);
     const st = await ensureAttached(tab.id);
     let msgs = st.console;
@@ -597,8 +684,8 @@ const handlers = {
     return { text: head + (lines.length ? '\n' + lines.join('\n') : '') };
   },
 
-  async handle_dialog({ tabId, accept = true, promptText } = {}) {
-    const tab = await resolveTab(tabId);
+  async handle_dialog({ tabId, accept = true, promptText } = {}, ctx) {
+    const tab = await resolveTab(ctx, tabId);
     const st = sessionFor(tab.id);
     if (!st || !st.dialog) throw new Error('No JavaScript dialog is open on this tab (dialogs are only detected on tabs the agent has interacted with).');
     const d = st.dialog;
@@ -609,10 +696,10 @@ const handlers = {
     return { text: `${accept ? 'Accepted' : 'Dismissed'} ${d.type} dialog "${d.message}".\n` + (await settle(tab.id, Date.now(), null)) };
   },
 
-  async upload_file({ tabId, ref, selector, paths } = {}) {
+  async upload_file({ tabId, ref, selector, paths } = {}, ctx) {
     const files = Array.isArray(paths) ? paths : paths ? [paths] : [];
     if (!files.length) throw new Error('paths (absolute file paths on this computer) is required.');
-    const tab = await resolveTab(tabId);
+    const tab = await resolveTab(ctx, tabId);
     const token = Math.random().toString(36).slice(2) + Date.now().toString(36);
     const info = await page(tab, 'tag', { ref, selector, token });
     try {
@@ -680,8 +767,8 @@ async function pressCombo(tabId, combo) {
 
 export const METHODS = Object.keys(handlers);
 
-export async function handleCommand(method, params) {
+export async function handleCommand(method, params, ctx) {
   const h = handlers[method];
   if (!h) throw new Error(`Unknown command "${method}". This extension supports: ${METHODS.join(', ')}. (Update the extension or the server so versions match.)`);
-  return await h(params || {});
+  return await h(params || {}, ctx);
 }

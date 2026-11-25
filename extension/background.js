@@ -1,5 +1,5 @@
 // Service worker: maintains WebSocket connections to local Claude bridge servers and runs their commands.
-import { handleCommand, getCurrentTabId } from './commands.js';
+import { handleCommand, releaseSession, configure } from './commands.js';
 import { detachAll, attachedTabIds } from './cdp.js';
 
 const PROTOCOL_VERSION = 1;
@@ -9,15 +9,22 @@ const DEFAULTS = {
   token: '',
   portStart: 18765,
   portCount: 10,
+  groupTabs: true,
 };
+// Per-session colours: tab-group colour name + matching badge colour.
+const PALETTE = [
+  ['blue', '#1a73e8'], ['orange', '#e8710a'], ['green', '#1e8e3e'], ['purple', '#a142f4'],
+  ['pink', '#d01884'], ['cyan', '#007b83'], ['red', '#d93025'], ['yellow', '#f9ab00'],
+];
 const SCAN_INTERVAL_MS = 3000;
 const PING_INTERVAL_MS = 20000;
-const LOG_SIZE = 50;
+const LOG_SIZE = 100;
+const SESSION_LOG_SIZE = 30;
 
 let settings = { ...DEFAULTS };
 let profileId = null;
 let email = '';
-/** port -> { port, ws, state: 'connecting'|'handshake'|'open', server, connectedAt, clientNonce } */
+/** port -> connection; once open it is also the session context used by commands.js */
 const conns = new Map();
 const activity = [];
 let initPromise = null;
@@ -30,6 +37,7 @@ function init() {
     initPromise = (async () => {
       const stored = await chrome.storage.local.get(['settings', 'profileId']);
       settings = { ...DEFAULTS, ...(stored.settings || {}) };
+      configure({ groupTabs: settings.groupTabs });
       profileId = stored.profileId;
       if (!profileId) {
         profileId = crypto.randomUUID();
@@ -43,7 +51,7 @@ function init() {
       updateBadge();
       scan();
     })().catch((e) => {
-      logActivity({ method: 'init-failed', ok: false, detail: String(e && e.message || e) });
+      logActivity(null, { method: 'init-failed', ok: false, detail: String(e && e.message || e) });
       initPromise = null;
     });
   }
@@ -77,6 +85,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== 'local' || !changes.settings) return;
   const prev = settings;
   settings = { ...DEFAULTS, ...(changes.settings.newValue || {}) };
+  configure({ groupTabs: settings.groupTabs });
   const reconnect = prev.token !== settings.token || prev.portStart !== settings.portStart ||
     prev.portCount !== settings.portCount || prev.profileLabel !== settings.profileLabel || !settings.enabled;
   if (reconnect) closeAll('settings changed');
@@ -129,7 +138,12 @@ async function probe(port) {
 }
 
 async function connect(port) {
-  const c = { port, ws: null, state: 'probing', server: null, connectedAt: null, clientNonce: null, cancelled: false };
+  const c = {
+    port, ws: null, state: 'probing', server: null, connectedAt: null, clientNonce: null, cancelled: false,
+    // session context (see commands.js)
+    number: 0, label: '', color: 'grey', badge: '', badgeColor: '#777', connected: false,
+    currentTabId: null, groups: new Map(), running: new Map(), activity: [], lastActionAt: null,
+  };
   conns.set(port, c);
   const alive = await probe(port);
   if (!alive || c.cancelled || conns.get(port) !== c || !settings.enabled) {
@@ -150,12 +164,15 @@ async function connect(port) {
   ws.onmessage = (ev) => {
     let msg;
     try { msg = JSON.parse(ev.data); } catch (_) { return; }
-    onMessage(c, msg).catch((e) => logActivity({ method: 'internal-error', ok: false, detail: String(e && e.message || e) }));
+    onMessage(c, msg).catch((e) => logActivity(c, { method: 'internal-error', ok: false, detail: String(e && e.message || e) }));
   };
   ws.onclose = () => {
     clearTimeout(handshakeTimer);
     if (conns.get(port) === c) conns.delete(port);
-    if (c.state === 'open') logActivity({ method: 'disconnected', ok: true, detail: serverLabel(c) });
+    if (c.state === 'open') {
+      logActivity(c, { method: 'session ended', ok: true, detail: serverLabel(c) });
+      endSession(c);
+    }
     updateBadge();
   };
   ws.onerror = () => { /* onclose follows */ };
@@ -171,7 +188,7 @@ function safeSend(c, obj) {
   try {
     if (c.ws && c.ws.readyState === WebSocket.OPEN) c.ws.send(JSON.stringify(obj));
   } catch (e) {
-    logActivity({ method: 'send-failed', ok: false, detail: String(e && e.message || e) });
+    logActivity(null, { method: 'send-failed', ok: false, detail: String(e && e.message || e) });
   }
 }
 
@@ -212,34 +229,38 @@ async function onMessage(c, msg) {
       if (settings.token) {
         const expected = await hmac(settings.token, 'server:' + c.clientNonce);
         if (msg.proof !== expected) {
-          logActivity({ method: 'token-mismatch', ok: false, detail: `Server on port ${c.port} does not know the shared token; disconnected.` });
+          logActivity(c, { method: 'token-mismatch', ok: false, detail: `Server on port ${c.port} does not know the shared token; disconnected.` });
           try { c.ws.close(4003, 'server token mismatch'); } catch (_) { /* ignore */ }
           return;
         }
       }
-      c.state = 'open';
       c.server = msg.server || {};
-      c.connectedAt = Date.now();
-      logActivity({ method: 'connected', ok: true, detail: serverLabel(c) });
+      startSession(c);
+      logActivity(c, { method: 'session started', ok: true, detail: serverLabel(c) });
       updateBadge();
       break;
     }
     case 'request': {
       if (c.state !== 'open') return;
       const started = Date.now();
+      c.running.set(msg.id, { method: msg.method, since: started, detail: brief(msg.params) });
+      c.lastActionAt = started;
       try {
-        const result = await handleCommand(msg.method, msg.params);
+        const result = await handleCommand(msg.method, msg.params, c);
         safeSend(c, { type: 'response', id: msg.id, result });
-        logActivity({ method: msg.method, ok: true, ms: Date.now() - started, detail: brief(msg.params) });
+        logActivity(c, { method: msg.method, ok: true, ms: Date.now() - started, detail: brief(msg.params), tabId: c.currentTabId });
       } catch (e) {
         const message = e && e.message ? e.message : String(e);
         safeSend(c, { type: 'response', id: msg.id, error: { message } });
-        logActivity({ method: msg.method, ok: false, ms: Date.now() - started, detail: message.slice(0, 160) });
+        logActivity(c, { method: msg.method, ok: false, ms: Date.now() - started, detail: message.slice(0, 200), tabId: c.currentTabId });
+      } finally {
+        c.running.delete(msg.id);
+        c.lastActionAt = Date.now();
       }
       break;
     }
     case 'error':
-      logActivity({ method: 'server-error', ok: false, detail: msg.message });
+      logActivity(c, { method: 'server-error', ok: false, detail: msg.message });
       break;
     case 'pong':
     default:
@@ -252,17 +273,54 @@ function serverLabel(c) {
   return `port ${c.port}${s.cwd ? ` — ${s.cwd}` : ''}`;
 }
 
+function basename(p) {
+  return String(p || '').replace(/[\\/]+$/, '').split(/[\\/]/).pop() || '';
+}
+
+function startSession(c) {
+  const used = new Set(openConns().map((o) => o.number));
+  let n = 1;
+  while (used.has(n)) n++;
+  const [color, hex] = PALETTE[(n - 1) % PALETTE.length];
+  Object.assign(c, {
+    state: 'open',
+    connected: true,
+    connectedAt: Date.now(),
+    number: n,
+    label: c.server.label || basename(c.server.cwd) || `session ${n}`,
+    color,
+    badge: 'C' + n,
+    badgeColor: hex,
+  });
+}
+
+function endSession(c) {
+  releaseSession(c);
+  // Mark the session's tab groups as finished.
+  for (const gid of c.groups.values()) {
+    chrome.tabGroups.update(gid, { title: `Claude · ${c.label} (ended)`, color: 'grey' }).catch(() => {});
+  }
+}
+
 function brief(params) {
   if (!params) return '';
   const p = { ...params };
   if (typeof p.text === 'string' && p.text.length > 40) p.text = p.text.slice(0, 40) + '…';
   if (typeof p.expression === 'string' && p.expression.length > 60) p.expression = p.expression.slice(0, 60) + '…';
   const s = JSON.stringify(p);
-  return s.length > 160 ? s.slice(0, 160) + '…' : s;
+  return s.length > 600 ? s.slice(0, 600) + '…' : s;
 }
 
-function logActivity(entry) {
-  activity.unshift({ time: Date.now(), ...entry });
+function logActivity(session, entry) {
+  const e = { time: Date.now(), ...entry };
+  if (session && session.number) {
+    e.session = session.number;
+    e.sessionLabel = session.label;
+    e.color = session.badgeColor;
+    session.activity.unshift(e);
+    if (session.activity.length > SESSION_LOG_SIZE) session.activity.length = SESSION_LOG_SIZE;
+  }
+  activity.unshift(e);
   if (activity.length > LOG_SIZE) activity.length = LOG_SIZE;
 }
 
@@ -292,20 +350,42 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     await init();
     switch (msg && msg.type) {
       case 'getStatus': {
-        const current = getCurrentTabId();
-        let currentTab = null;
-        if (current != null) currentTab = await chrome.tabs.get(current).catch(() => null);
+        const sessions = [];
+        for (const c of openConns().sort((a, b) => a.number - b.number)) {
+          let tab = null;
+          if (c.currentTabId != null) {
+            const t = await chrome.tabs.get(c.currentTabId).catch(() => null);
+            if (t) tab = { id: t.id, windowId: t.windowId, title: t.title, url: t.pendingUrl || t.url, favIconUrl: t.favIconUrl, active: t.active, status: t.status };
+          }
+          sessions.push({
+            number: c.number,
+            label: c.label,
+            color: c.badgeColor,
+            cwd: c.server.cwd,
+            pid: c.server.pid,
+            port: c.port,
+            connectedAt: c.connectedAt,
+            lastActionAt: c.lastActionAt,
+            running: [...c.running.values()],
+            tab,
+            activity: c.activity.slice(0, 8),
+          });
+        }
         return {
           settings,
           profileId,
           email,
           label: profileLabel(),
           ports: ports(),
-          connections: openConns().map((c) => ({ port: c.port, server: c.server, connectedAt: c.connectedAt })),
+          sessions,
           attachedTabs: attachedTabIds().length,
-          agentTab: currentTab ? { id: currentTab.id, title: currentTab.title, url: currentTab.url } : null,
           activity,
         };
+      }
+      case 'focusTab': {
+        const t = await chrome.tabs.update(Number(msg.tabId), { active: true });
+        await chrome.windows.update(t.windowId, { focused: true });
+        return { ok: true };
       }
       case 'saveSettings': {
         const next = { ...settings, ...(msg.settings || {}) };
@@ -320,7 +400,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         return { ok: true };
       case 'detachAll': {
         const n = await detachAll();
-        logActivity({ method: 'release-tabs', ok: true, detail: `${n} tab(s)` });
+        logActivity(null, { method: 'release-tabs', ok: true, detail: `${n} tab(s)` });
         return { ok: true, count: n };
       }
       default:

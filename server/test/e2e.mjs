@@ -310,6 +310,50 @@ async function main() {
     r = await call('snapshot');
     check('restricted page error', r.isError && /does not allow/.test(text(r)), text(r));
 
+    // ---- a second, simultaneous Claude session (its own server on the next port)
+    const clientB = new Client({ name: 'e2e-b', version: '1.0.0' });
+    await clientB.connect(new StdioClientTransport({
+      command: process.execPath,
+      args: [serverPath],
+      env: { ...process.env, CHROME_BRIDGE_CONNECT_WAIT_MS: '30000', CHROME_BRIDGE_PORT_START: String(TEST_PORT_START), CHROME_BRIDGE_PORT_COUNT: String(TEST_PORT_COUNT), CHROME_BRIDGE_SESSION_NAME: 'second-project' },
+      stderr: 'pipe',
+    }));
+    const callB = (name, args = {}) => clientB.callTool({ name, arguments: args });
+    r = await callB('tab_new', { url: base + '/second' });
+    check('session B opens its own tab', /Second/.test(text(r)), text(r));
+    const tabB = Number((/\[tab (\d+)\]/.exec(text(r)) || [])[1]);
+    r = await callB('tab_select', { tabId: Number(testTab) });
+    check('session B cannot grab session A\'s tab', r.isError && /another Claude session/.test(text(r)), text(r));
+    r = await call('tabs_list');
+    check('session A sees B\'s tab as foreign', new RegExp(`\\[tab ${tabB}\\].*controlled by other Claude session "second-project"`).test(text(r)), text(r));
+    r = await call('snapshot', { tabId: tabB });
+    check('session A refused on B\'s tab', r.isError && /another Claude session/.test(text(r)), text(r));
+    r = await callB('snapshot', { interactiveOnly: true });
+    check('session B keeps working in its tab', /Second page/.test(text(r)), text(r));
+
+    // ---- dashboard (popup / side panel) status
+    const { targetId: popupId } = await browser.send('Target.createTarget', { url: `chrome-extension://${extId}/popup.html?panel=1` });
+    const popup = (await browser.send('Target.attachToTarget', { targetId: popupId, flatten: true })).sessionId;
+    await sleep(1500);
+    const st = await browser.evaluate(popup, `chrome.runtime.sendMessage({ type: 'getStatus' })`);
+    const brief = JSON.stringify(st.sessions.map((s) => ({ n: s.number, label: s.label, tab: s.tab && s.tab.url, acts: s.activity.length })));
+    check('dashboard lists both sessions with their tab URL', st.sessions.length === 2 &&
+      st.sessions.every((s) => s.tab && s.tab.url) && st.sessions.some((s) => s.label === 'second-project' && /\/second/.test(s.tab.url)), brief);
+    check('dashboard has per-session activity', st.sessions.every((s) => s.activity.length > 0), brief);
+    const groups = await browser.evaluate(popup, `chrome.tabGroups.query({}).then((g) => g.map((x) => x.title + ':' + x.color))`);
+    check('each session\'s tabs are in its own tab group', groups.some((t) => /^Claude · second-project:/.test(t)) && groups.length === 2, JSON.stringify(groups));
+    await browser.send('Emulation.setDeviceMetricsOverride', { width: 420, height: 900, deviceScaleFactor: 1, mobile: false }, popup);
+    await sleep(1200);
+    const shot = await browser.send('Page.captureScreenshot', { format: 'png' }, popup);
+    if (process.env.DASHBOARD_SHOT) fs.writeFileSync(process.env.DASHBOARD_SHOT, Buffer.from(shot.data, 'base64'));
+
+    r = await callB('tab_select', { tabId: Number(testTab), takeOver: true });
+    check('takeOver lets a session take a tab when asked', !r.isError, text(r));
+    await clientB.close();
+    await sleep(500);
+    const groupsAfter = await browser.evaluate(popup, `chrome.tabGroups.query({}).then((g) => g.map((x) => x.title))`);
+    check('ended session\'s group is marked ended', groupsAfter.some((t) => /second-project \(ended\)/.test(t)), JSON.stringify(groupsAfter));
+
     // The Claude session ends: the server goes away while the extension keeps scanning for sessions.
     await client.close().catch(() => {});
     await sleep(8000);

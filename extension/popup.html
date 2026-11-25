@@ -11,22 +11,28 @@
       <span id="dot" class="dot"></span>
       <h1>Claude Browser Bridge</h1>
     </div>
-    <label class="switch" title="Allow Claude sessions to connect to this profile">
-      <input type="checkbox" id="enabled">
-      <span class="slider"></span>
-    </label>
+    <div class="header-actions">
+      <button id="openPanel" class="icon-btn" title="Open in side panel (stays open while you browse)">⇥</button>
+      <label class="switch" title="Allow Claude sessions to control this profile">
+        <input type="checkbox" id="enabled">
+        <span class="slider"></span>
+      </label>
+    </div>
   </header>
 
-  <section>
-    <div id="status" class="status">Loading…</div>
-    <ul id="sessions" class="sessions"></ul>
-    <div id="agentTab" class="muted small"></div>
+  <div id="summary" class="summary">Loading…</div>
+
+  <main id="sessions" class="sessions"></main>
+
+  <section class="row actions">
+    <button id="detach" title="Detach the debugger from every tab (removes Chrome's 'started debugging' bar)">Release all tabs</button>
+    <button id="reconnect" title="Drop and re-establish all session connections">Reconnect</button>
   </section>
 
-  <section class="row">
-    <button id="reconnect">Reconnect</button>
-    <button id="detach" title="Detach the debugger from every tab (removes the 'started debugging' bar)">Release all tabs</button>
-  </section>
+  <details id="allActivity">
+    <summary>All activity</summary>
+    <ol id="activity" class="activity"></ol>
+  </details>
 
   <details>
     <summary>Settings</summary>
@@ -34,6 +40,7 @@
       <label>Profile name shown to Claude
         <input id="profileLabel" type="text" placeholder="e.g. Work, Personal">
       </label>
+      <label class="check"><input id="groupTabs" type="checkbox"> Put tabs Claude opens into a coloured tab group per session</label>
       <label>Shared token (optional; must match CHROME_BRIDGE_TOKEN on the server)
         <input id="token" type="password" autocomplete="off" placeholder="leave empty to disable">
       </label>
@@ -41,15 +48,12 @@
         <label>First port <input id="portStart" type="number" min="1024" max="65000"></label>
         <label>Port count <input id="portCount" type="number" min="1" max="50"></label>
       </div>
-      <button type="submit">Save</button>
-      <span id="saved" class="muted small"></span>
+      <div class="row">
+        <button type="submit">Save</button>
+        <span id="saved" class="muted small"></span>
+      </div>
     </form>
     <div class="muted small" id="profileInfo"></div>
-  </details>
-
-  <details>
-    <summary>Recent activity</summary>
-    <ol id="activity" class="activity"></ol>
   </details>
 
   <script src="popup.js"></script>

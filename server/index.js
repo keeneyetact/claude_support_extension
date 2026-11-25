@@ -5,6 +5,7 @@
 // stdout is reserved for MCP traffic; all logs go to stderr.
 import http from 'node:http';
 import crypto from 'node:crypto';
+import path from 'node:path';
 import { readFileSync } from 'node:fs';
 import { WebSocketServer } from 'ws';
 import { z } from 'zod';
@@ -17,6 +18,7 @@ const PORT_COUNT = Number(process.env.CHROME_BRIDGE_PORT_COUNT || 10);
 const TOKEN = process.env.CHROME_BRIDGE_TOKEN || '';
 const CONNECT_WAIT_MS = Number(process.env.CHROME_BRIDGE_CONNECT_WAIT_MS || 12000);
 const PROTOCOL_VERSION = 1;
+const SESSION_NAME = process.env.CHROME_BRIDGE_SESSION_NAME || path.basename(process.cwd()) || '';
 
 const log = (...a) => console.error('[chrome-bridge]', ...a);
 const hmac = (key, data) => crypto.createHmac('sha256', key).update(data).digest('hex');
@@ -137,7 +139,15 @@ class Bridge {
           type: 'welcome',
           protocol: PROTOCOL_VERSION,
           proof: TOKEN ? hmac(TOKEN, 'server:' + msg.clientNonce) : null,
-          server: { name: 'claude-browser-bridge', version: pkg.version, pid: process.pid, cwd: process.cwd(), port: this.port },
+          server: {
+            name: 'claude-browser-bridge',
+            version: pkg.version,
+            pid: process.pid,
+            cwd: process.cwd(),
+            port: this.port,
+            // Shown in the extension popup and the tab-group title; defaults to the project folder name.
+            label: SESSION_NAME,
+          },
         });
         log(`profile connected: "${conn.info.label}" (${conn.info.profileId.slice(0, 8)}, ext v${conn.info.extensionVersion})`);
         for (const w of this.waiters) w();
@@ -256,7 +266,8 @@ Workflow:
 3. Act with click / type / select_option / press_key / scroll / hover using those refs (refs beat coordinates).
 4. Re-snapshot after the page changes; refs from old snapshots can go stale.
 Use screenshot when layout/visuals matter or for canvas/cross-origin-iframe content (then click by x,y).
-Commands without tabId act on the "agent tab": the last tab you opened/selected/used (initially the active tab).
+Commands without tabId act on YOUR "agent tab": the last tab you opened/selected/used (initially the active tab).
+Each Claude session has its own agent tab. Tabs controlled by another Claude session are off-limits: open your own with tab_new.
 If several Chrome profiles are connected, pass "profile" or call select_profile.
 This is the user's real browser: don't close their tabs, submit forms, make purchases, send messages, or change account settings unless asked.`;
 
@@ -355,6 +366,7 @@ browserTool('tab_select', 'Make a tab the agent tab (target of later commands) a
   tabId: z.number().int().describe('Tab id from tabs_list.'),
   activate: z.boolean().optional().describe('Bring the tab to the front in its window (default true).'),
   focusWindow: z.boolean().optional().describe('Also focus its window (default false).'),
+  takeOver: z.boolean().optional().describe('Take the tab over even if another Claude session controls it. Only when the user asked for it.'),
 }, { annotations: ACT });
 
 browserTool('tab_close', 'Close a tab (default: the agent tab). Do not close the user\'s own tabs unless asked.', {

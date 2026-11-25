@@ -55,7 +55,7 @@ Just ask Claude, for example:
 | Tool | What it does |
 |---|---|
 | `list_profiles`, `select_profile` | See and choose the connected Chrome profiles |
-| `tabs_list`, `tab_new`, `tab_select`, `tab_close` | Work with windows and tabs |
+| `tabs_list`, `tab_new`, `tab_select`, `tab_close` | Work with windows and tabs (`tabs_list` marks the session's own tab and tabs other sessions control) |
 | `navigate` | Go to a URL, or `back` / `forward` / `reload`, and wait for the page to load |
 | `snapshot` | Page outline (headings, text, links, buttons, inputs with values and states) where every interactive element gets a `[ref=eN]` |
 | `find` | Search visible elements by label or text and get their refs |
@@ -76,9 +76,28 @@ It also handles:
 * Refs that stay unique across navigations, so a stale ref is reported as an error instead of matching the wrong element.
 * Clicks that open new tabs or dialogs. Claude is told what happened.
 
-### The "agent tab"
+### One tab per Claude session
 
-Commands without a `tabId` go to the **agent tab**. That's the last tab Claude opened, selected or used, and at first it's the active tab. When you switch tabs yourself, Claude keeps working in its own tab instead of following you.
+Each Claude Code session works in **its own agent tab**. That's the last tab the session opened, selected or used, and at first it's the active tab. When you switch tabs yourself, Claude keeps working in its own tab instead of following you.
+
+You can run several Claude sessions at once, each driving a different tab:
+
+* A tab can be controlled by only **one session at a time**. If session B tries to use session A's tab, it gets an error and is told to open its own with `tab_new`. It can take the tab over (`tab_select` with `takeOver: true`) only when you ask it to.
+* Tabs a session opens go into a **coloured tab group** named `Claude · <project>`. When the session ends, the group is greyed out and marked *(ended)*. You can turn grouping off in Settings.
+* On a tab that a session controls, the toolbar icon shows that session's badge (`C1`, `C2`, …) in its colour.
+
+### Watching what Claude is doing
+
+Click the toolbar icon to open the dashboard. Click **⇥** to open it in Chrome's **side panel**, where it stays open while you browse. For each connected Claude session you see:
+
+* its number and colour (`C1`, `C2`, …), its project name (the folder Claude Code runs in), and its port and pid;
+* **Working…** with the current action, or **idle** with how long ago it last acted;
+* its tab's live title and URL. Click it to jump to that tab;
+* its latest actions, each marked ✓ or ✗.
+
+*All activity* is one combined log of every session.
+
+To give a session a nicer name, add `--env CHROME_BRIDGE_SESSION_NAME=<name>` to the `claude mcp add` command. Otherwise the project folder name is used.
 
 ## Security model
 
@@ -89,7 +108,7 @@ Commands without a `tabId` go to the **agent tab**. That's the last tab Claude o
   * Enter the same string in the extension's *Settings → Shared token*.
   * Both sides then prove they know the token through an HMAC challenge/response, and the token itself is never sent.
 * While Claude controls a tab, Chrome shows its standard **"Claude Browser Bridge started debugging this browser"** bar. That bar is your signal that the agent is in control. *Release all tabs* in the popup detaches the debugger, and the switch in the popup turns the bridge off for that profile.
-* The popup's *Recent activity* lists every command that was run.
+* The dashboard shows each session's tab and every command it ran.
 
 Chrome doesn't let any extension control `chrome://` pages, the Chrome Web Store or other extensions' pages.
 
@@ -101,6 +120,7 @@ Chrome doesn't let any extension control `chrome://` pages, the Chrome Web Store
 | `CHROME_BRIDGE_PORT_COUNT` | `10` | How many ports to try. This must match the extension's *Port count* |
 | `CHROME_BRIDGE_TOKEN` | *(none)* | Shared secret. When set, the extension must have the same token |
 | `CHROME_BRIDGE_CONNECT_WAIT_MS` | `12000` | How long a tool call waits for a profile to connect |
+| `CHROME_BRIDGE_SESSION_NAME` | project folder name | The session's name in the dashboard and in tab-group titles |
 
 ## Development
 
