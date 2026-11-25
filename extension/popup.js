@@ -215,12 +215,13 @@ async function refresh() {
   renderHandoff(st);
   const n = st.sessions.length;
   const working = st.sessions.filter((s) => s.running.length).length;
+  const idle = st.sessions.filter((s) => !s.tab && !s.running.length).length;
   $('enabled').checked = !!st.settings.enabled;
   $('dot').className = 'dot ' + (!st.settings.enabled ? 'off' : n ? 'on' : '');
   $('summary').textContent = !st.settings.enabled
     ? 'Disabled. Claude cannot control this profile.'
     : n
-      ? `${n} Claude session${n > 1 ? 's' : ''} connected${working ? ` · ${working} working` : ''}`
+      ? `${n} Claude session${n > 1 ? 's' : ''} connected${working ? ` · ${working} working` : ''}${idle ? ` · ${idle} without a tab` : ''}`
       : 'No Claude session connected';
 
   const box = $('sessions');
@@ -231,7 +232,10 @@ async function refresh() {
       `Waiting for Claude Code… Start a Claude Code session that has the chrome-bridge MCP server. ` +
       `Scanning ports ${st.ports[0]}–${st.ports[st.ports.length - 1]}.`));
   } else {
-    box.replaceChildren(...st.sessions.map(sessionCard));
+    // Sessions without a tab are just connected in the background; the copied
+    // prompt is how one gets a tab, so only sessions with a tab get a card.
+    const active = st.sessions.filter((s) => s.tab || s.running.length);
+    box.replaceChildren(...active.map(sessionCard));
   }
 
   $('profileInfo').textContent = `Shown to Claude as "${st.label}"${st.email && st.email !== st.label ? ` (${st.email})` : ''} · id ${st.profileId.slice(0, 8)}` +
