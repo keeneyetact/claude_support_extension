@@ -362,8 +362,33 @@ async function main() {
     const free = await browser.evaluate(popup, `chrome.runtime.sendMessage({ type: 'getStatus' }).then((st) =>
       buildPrompt(st, { id: 999999, title: 'Free', url: 'https://example.com/' }, null, ''))`);
     check('prompt for a free tab has no takeOver', !/takeOver/.test(free) && /wait for my instructions/.test(free), free);
-    const ownerText = await browser.evaluate(popup, `document.getElementById('handoffOwner').textContent + '|' + document.getElementById('copyPrompt').disabled`);
-    check('popup refuses to hand over a chrome-extension:// page', /doesn't let extensions/.test(ownerText) && ownerText.endsWith('|true'), ownerText);
+    const ownerText = await browser.evaluate(popup, `document.getElementById('tabStatus').textContent + '|' + document.getElementById('copyPrompt').disabled`);
+    check('popup refuses to hand over a chrome-extension:// page', /can't control this page/.test(ownerText) && ownerText.endsWith('|true'), ownerText);
+
+    // "This tab" status, as seen while the user is on a controlled tab and on a free tab.
+    const viewAs = async (tabExpr) => {
+      await browser.evaluate(popup, `(() => {
+        const realQuery = chrome.tabs.__realQuery || chrome.tabs.query.bind(chrome.tabs);
+        chrome.tabs.__realQuery = realQuery;
+        chrome.tabs.query = async (q) => (q && q.active && q.currentWindow) ? [await (${tabExpr})] : realQuery(q);
+        return refresh();
+      })()`);
+      return browser.evaluate(popup, `({ status: document.getElementById('tabStatus').textContent, give: document.getElementById('give').open,
+        summary: document.getElementById('giveSummary').textContent, here: !!document.querySelector('.card .here') })`);
+    };
+    let view = await viewAs(`chrome.tabs.get(${tabB})`);
+    check('popup says a controlled tab is controlled, and by which session', /Controlled by Claude/.test(view.status) && /second-project/.test(view.status) && view.here && !view.give && /different session/.test(view.summary), JSON.stringify(view));
+    if (process.env.DASHBOARD_SHOT) {
+      const s2 = await browser.send('Page.captureScreenshot', { format: 'png' }, popup);
+      fs.writeFileSync(process.env.DASHBOARD_SHOT.replace(/(\.png)?$/, '-controlled.png'), Buffer.from(s2.data, 'base64'));
+    }
+    view = await viewAs(`({ id: 999999, windowId: 1, title: 'Free page', url: 'https://example.com/' })`);
+    check('popup says a free tab is not controlled and offers to give it', /Not controlled by Claude/.test(view.status) && view.give, JSON.stringify(view));
+    if (process.env.DASHBOARD_SHOT) {
+      const s3 = await browser.send('Page.captureScreenshot', { format: 'png' }, popup);
+      fs.writeFileSync(process.env.DASHBOARD_SHOT.replace(/(\.png)?$/, '-free.png'), Buffer.from(s3.data, 'base64'));
+    }
+    await browser.evaluate(popup, `(() => { chrome.tabs.query = chrome.tabs.__realQuery; return refresh(); })()`);
 
     r = await callB('tab_select', { tabId: Number(testTab), takeOver: true });
     check('takeOver lets a session take a tab when asked', !r.isError, text(r));
@@ -372,6 +397,15 @@ async function main() {
     await callB('tab_select', { tabId: tabB });
     await sleep(300);
     check('indicator shows on the tab a session switches to', (await hasIndicator(tabB)) === true);
+    if (process.env.INDICATOR_SHOT) {
+      // Screenshot of a controlled page as the user sees it (with the on-page marker).
+      const t = (await browser.send('Target.getTargets')).targetInfos.find((x) => x.type === 'page' && /\/second/.test(x.url));
+      const s = (await browser.send('Target.attachToTarget', { targetId: t.targetId, flatten: true })).sessionId;
+      await browser.send('Emulation.setDeviceMetricsOverride', { width: 1000, height: 560, deviceScaleFactor: 1, mobile: false }, s);
+      await sleep(600);
+      const img = await browser.send('Page.captureScreenshot', { format: 'png' }, s);
+      fs.writeFileSync(process.env.INDICATOR_SHOT, Buffer.from(img.data, 'base64'));
+    }
     await clientB.close();
     await sleep(500);
     const groupsAfter = await browser.evaluate(popup, `chrome.tabGroups.query({}).then((g) => g.map((x) => x.title))`);

@@ -20,31 +20,31 @@
     </div>
   </header>
 
-  <div id="summary" class="summary">Loading…</div>
-
-  <section id="handoff" class="handoff">
-    <div class="handoff-head">
-      <strong>Give this tab to a Claude session</strong>
-      <span id="handoffOwner" class="muted small"></span>
-    </div>
+  <section id="thisTab" class="this-tab">
+    <div class="eyebrow">This tab</div>
     <div id="handoffTab" class="tab static"></div>
-    <textarea id="task" rows="2" placeholder="What should Claude do here? (optional: you can also tell it later)"></textarea>
-    <div class="row">
-      <button id="copyPrompt" class="primary" title="Copy a prompt to paste into any Claude Code session">Copy prompt for Claude</button>
-      <span id="copied" class="muted small"></span>
-    </div>
-    <details class="preview">
-      <summary class="muted small">Preview prompt</summary>
-      <pre id="promptPreview"></pre>
+    <div id="tabStatus" class="tab-status"></div>
+
+    <details id="give" class="give">
+      <summary id="giveSummary">Give this tab to a Claude session</summary>
+      <p class="muted small">Copy a prompt, then paste it into any Claude Code session. That session takes over this tab.</p>
+      <textarea id="task" rows="2" placeholder="What should Claude do here? (optional)"></textarea>
+      <div class="row">
+        <button id="copyPrompt" class="primary">Copy prompt for Claude</button>
+        <span id="copied" class="muted small"></span>
+      </div>
+      <details class="preview">
+        <summary class="muted small">Preview prompt</summary>
+        <pre id="promptPreview"></pre>
+      </details>
     </details>
   </section>
 
+  <div class="section-head">
+    <h2>Claude sessions</h2>
+    <span id="summary" class="muted small">Loading…</span>
+  </div>
   <main id="sessions" class="sessions"></main>
-
-  <details id="sessionListBox" class="session-list-box">
-    <summary>Sessions &amp; tabs <span id="sessionCount" class="muted small"></span></summary>
-    <ul id="sessionList" class="session-list"></ul>
-  </details>
 
   <section class="row actions">
     <button id="detach" title="Detach the debugger from every tab (removes Chrome's 'started debugging' bar)">Release all tabs</button>

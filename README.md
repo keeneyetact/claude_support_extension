@@ -97,16 +97,27 @@ You can run several Claude sessions at once, each driving a different tab:
 * A tab can be controlled by only **one session at a time**. If session B tries to use session A's tab, it gets an error and is told to open its own with `tab_new`. It can take the tab over (`tab_select` with `takeOver: true`) only when you ask it to.
 * Tabs a session opens go into a **coloured tab group** named `Claude · <project>`. When the session ends, the group is greyed out and marked *(ended)*. You can turn grouping off in Settings.
 * On a tab that a session controls, the toolbar icon shows that session's badge (`C1`, `C2`, …) in its colour.
-* The page itself gets a thin frame in the session's colour and a small `Claude C1 · <project>` label in the bottom-left corner, which also shows the command that is running. It ignores the mouse, is hidden while Claude takes screenshots, and is left out of snapshots. It disappears as soon as the tab is released or the session ends. If a tab has no frame, no Claude session is controlling it.
+* The page itself gets a thin frame in the session's colour and a label in the bottom-left corner: **Claude is controlling this tab** (or **Claude is clicking…**, **Claude is typing…** while it acts), with the session's badge and project name. The label ignores the mouse, is hidden while Claude takes screenshots, and is left out of what Claude reads from the page. It disappears as soon as the tab is released or the session ends. **If a tab has no frame, no Claude session is controlling it.**
 
 ### Watching what Claude is doing
 
-Click the toolbar icon to open the dashboard. Click **⇥** to open it in Chrome's **side panel**, where it stays open while you browse. For each connected Claude session you see:
+Click the toolbar icon to open the dashboard. Click **⇥** to open it in Chrome's **side panel**, where it stays open while you browse and follows the tab you switch to.
 
-* its number and colour (`C1`, `C2`, …), its project name (the folder Claude Code runs in), and its port and pid;
-* **Working…** with the current action, or **idle** with how long ago it last acted;
-* its tab's live title and URL. Click it to jump to that tab;
-* its latest actions, each marked ✓ or ✗.
+**This tab**, at the top, answers "is Claude controlling the tab I'm looking at?":
+
+* **Controlled by Claude**, in the session's colour, with its badge, project name and what it is doing. *Show session* jumps to its card.
+* **Not controlled by Claude**, with *Give this tab to a Claude session* open below it.
+* **Claude can't control this page** on `chrome://` pages and the Web Store.
+
+**Claude sessions** has one card per session that is using a tab:
+
+* its badge and colour (`C1`, `C2`, …, the same badge as on the toolbar icon and the page) and its project name (the folder Claude Code runs in);
+* **Working: <action>…**, or **Idle**;
+* its tab's live title and URL, marked **This tab** when it's the one you're on. Click it to jump to that tab;
+* its latest actions, each marked ✓ or ✗ (failures in red);
+* **Details**: tab and window ids, folder, port, pid, server version, when it connected and how many commands it has run or failed.
+
+Sessions that are connected but not using a tab are folded into *N sessions without a tab*.
 
 *All activity* is one combined log of every session.
 

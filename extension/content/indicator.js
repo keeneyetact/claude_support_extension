@@ -23,18 +23,24 @@
       <style>
         .frame { position: fixed; inset: 0; pointer-events: none; box-shadow: inset 0 0 0 3px var(--c); }
         .pill {
-          position: fixed; left: 10px; bottom: 10px; pointer-events: none; display: flex; align-items: center; gap: 6px;
-          font: 600 12px/1.3 system-ui, -apple-system, "Segoe UI", sans-serif; color: #fff; background: var(--c);
-          padding: 4px 10px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,.3); opacity: .92;
-          max-width: 60vw; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+          position: fixed; left: 12px; bottom: 12px; pointer-events: none; display: flex; align-items: center; gap: 8px;
+          font: 13px/1.3 system-ui, -apple-system, "Segoe UI", sans-serif; color: #fff; background: var(--c);
+          padding: 6px 12px 6px 10px; border-radius: 16px; box-shadow: 0 2px 10px rgba(0,0,0,.35);
+          max-width: min(70vw, 560px); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
         }
-        .dot { width: 7px; height: 7px; border-radius: 50%; background: #fff; flex: none; }
+        .dot { width: 8px; height: 8px; border-radius: 50%; background: #fff; flex: none; }
         .working .dot { animation: pulse 1s ease-in-out infinite; }
         @keyframes pulse { 50% { opacity: .3; } }
+        .main { font-weight: 700; }
+        .who { opacity: .85; overflow: hidden; text-overflow: ellipsis; }
+        .badge { font-weight: 700; font-size: 11px; background: rgba(255,255,255,.25); padding: 0 5px; border-radius: 5px; flex: none; }
       </style>
       <div class="frame"></div>
-      <div class="pill"><span class="dot"></span><span class="txt"></span></div>`;
-    parts = { root, pill: root.querySelector('.pill'), txt: root.querySelector('.txt') };
+      <div class="pill"><span class="dot"></span><span class="main"></span><span class="badge"></span><span class="who"></span></div>`;
+    parts = {
+      pill: root.querySelector('.pill'), main: root.querySelector('.main'),
+      badge: root.querySelector('.badge'), who: root.querySelector('.who'),
+    };
   }
 
   function remove() {
@@ -54,7 +60,9 @@
     host.style.display = hidden ? 'none' : 'block';
     host.style.setProperty('--c', owner.color);
     parts.pill.classList.toggle('working', !!owner.working);
-    parts.txt.textContent = `Claude C${owner.number} · ${owner.label}${owner.working ? ` · ${owner.working}…` : ''}`;
+    parts.main.textContent = owner.working ? `Claude is ${owner.working}…` : 'Claude is controlling this tab';
+    parts.badge.textContent = 'C' + owner.number;
+    parts.who.textContent = owner.label;
   }
 
   async function check() {

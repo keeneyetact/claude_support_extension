@@ -16,6 +16,14 @@ const PALETTE = [
   ['blue', '#1a73e8'], ['orange', '#e8710a'], ['green', '#1e8e3e'], ['purple', '#a142f4'],
   ['pink', '#d01884'], ['cyan', '#007b83'], ['red', '#d93025'], ['yellow', '#f9ab00'],
 ];
+// What the on-page marker says while a command runs: "Claude is <doing>…".
+const DOING = {
+  tabs_list: 'looking at tabs', tab_new: 'opening a tab', tab_select: 'switching tabs', tab_close: 'closing a tab',
+  navigate: 'loading a page', snapshot: 'reading the page', find: 'searching the page', get_text: 'reading text',
+  screenshot: 'taking a screenshot', click: 'clicking', hover: 'hovering', drag: 'dragging', type: 'typing',
+  press_key: 'pressing keys', select_option: 'choosing an option', scroll: 'scrolling', evaluate: 'running a script',
+  wait_for: 'waiting', console_messages: 'reading the console', handle_dialog: 'answering a dialog', upload_file: 'uploading a file',
+};
 const SCAN_INTERVAL_MS = 3000;
 const PING_INTERVAL_MS = 20000;
 const LOG_SIZE = 100;
@@ -402,7 +410,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const c = settings.enabled && sender.tab ? ownerOf(sender.tab.id) : null;
         if (!c || !c.connected) return { owner: null };
         const running = c.running.values().next().value;
-        return { owner: { number: c.number, label: c.label, color: c.badgeColor, working: running ? running.method.replace(/_/g, ' ') : '' } };
+        return { owner: { number: c.number, label: c.label, color: c.badgeColor, working: running ? (DOING[running.method] || 'working') : '' } };
       }
       case 'focusTab': {
         const t = await chrome.tabs.update(Number(msg.tabId), { active: true });
