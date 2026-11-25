@@ -1,0 +1,25 @@
+{
+  "name": "claude-browser-bridge-server",
+  "version": "1.0.0",
+  "description": "MCP server that lets Claude Code control your real Chrome profiles via the Claude Browser Bridge extension",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node test/protocol.mjs && node test/e2e.mjs",
+    "test:protocol": "node test/protocol.mjs",
+    "test:e2e": "node test/e2e.mjs"
+  },
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "ws": "^8.23.0",
+    "zod": "^4.6.7"
+  },
+  "bin": {
+    "claude-browser-bridge": "index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

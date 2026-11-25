@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Claude Browser Bridge</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <div class="title">
+      <span id="dot" class="dot"></span>
+      <h1>Claude Browser Bridge</h1>
+    </div>
+    <label class="switch" title="Allow Claude sessions to connect to this profile">
+      <input type="checkbox" id="enabled">
+      <span class="slider"></span>
+    </label>
+  </header>
+
+  <section>
+    <div id="status" class="status">Loading…</div>
+    <ul id="sessions" class="sessions"></ul>
+    <div id="agentTab" class="muted small"></div>
+  </section>
+
+  <section class="row">
+    <button id="reconnect">Reconnect</button>
+    <button id="detach" title="Detach the debugger from every tab (removes the 'started debugging' bar)">Release all tabs</button>
+  </section>
+
+  <details>
+    <summary>Settings</summary>
+    <form id="settings">
+      <label>Profile name shown to Claude
+        <input id="profileLabel" type="text" placeholder="e.g. Work, Personal">
+      </label>
+      <label>Shared token (optional; must match CHROME_BRIDGE_TOKEN on the server)
+        <input id="token" type="password" autocomplete="off" placeholder="leave empty to disable">
+      </label>
+      <div class="row">
+        <label>First port <input id="portStart" type="number" min="1024" max="65000"></label>
+        <label>Port count <input id="portCount" type="number" min="1" max="50"></label>
+      </div>
+      <button type="submit">Save</button>
+      <span id="saved" class="muted small"></span>
+    </form>
+    <div class="muted small" id="profileInfo"></div>
+  </details>
+
+  <details>
+    <summary>Recent activity</summary>
+    <ol id="activity" class="activity"></ol>
+  </details>
+
+  <script src="popup.js"></script>
+</body>
+</html>
