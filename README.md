@@ -50,7 +50,7 @@ Repeat this for every profile. While a Claude session is running, the toolbar ba
 2. Click the extension icon. Optionally, type what Claude should do.
 3. Click **Copy prompt for Claude** and paste it into any Claude Code session.
 
-The prompt tells the session which profile and tab to use (`select_profile`, then `tab_select`), what to do if the tab id has changed, and to stay in that tab. If another session holds the tab, the prompt says you're handing it over (`takeOver: true`). If the session doesn't have the chrome-bridge tools yet, the prompt gives it the exact `claude mcp add` command to run, and it asks you to restart.
+The prompt tells the session which profile and tab to use (`select_profile`, then `tab_select`), what to do if the tab id has changed, and to stay in that tab. If another session holds the tab, the prompt says you're handing it over (`takeOver: true`). If the session doesn't have the chrome-bridge tools yet, the prompt gives it the exact `claude mcp add` command to run, and it asks you to restart. The path in that command comes from `extension/server-path.json`, which the server writes with its own absolute path on `npm install` and each time it starts.
 
 To have several sessions work at once, copy a prompt from a different tab for each one.
 

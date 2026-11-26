@@ -41,6 +41,22 @@ const activity = [];
 let initPromise = null;
 let loopsStarted = false;
 
+/**
+ * Exact path of server/index.js next to this extension folder, written by the server on
+ * `npm install` and on every start (extension/server-path.json). Unpacked extensions read
+ * their files from disk, so this sees the current file without a reload.
+ */
+async function localServerScript() {
+  try {
+    const res = await fetch(chrome.runtime.getURL('server-path.json'), { cache: 'no-store' });
+    if (!res.ok) return '';
+    const j = await res.json();
+    return typeof j.script === 'string' ? j.script : '';
+  } catch (_) {
+    return '';
+  }
+}
+
 // ------------------------------------------------------------------ init
 
 function init() {
@@ -410,7 +426,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           profileId,
           email,
           label: profileLabel(),
-          serverScript,
+          serverScript: (await localServerScript()) || serverScript,
           ports: ports(),
           sessions,
           attachedTabs: attachedTabIds().length,

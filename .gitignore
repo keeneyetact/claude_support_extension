@@ -1,3 +1,5 @@
 node_modules/
 *.log
 .DS_Store
+# Written by the server with its own absolute path (see server/extension-path.js).
+extension/server-path.json

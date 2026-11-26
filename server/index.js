@@ -10,6 +10,7 @@ import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { readFileSync, existsSync, readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { writeExtensionPath } from './extension-path.js';
 import { WebSocketServer } from 'ws';
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -658,6 +659,7 @@ browserTool('extension_reload', 'Reload an unpacked (developer) Chrome extension
 // ------------------------------------------------------------------ start
 
 async function main() {
+  writeExtensionPath(); // keeps the path in the extension's copied prompt exact
   sessionInfo.start();
   await bridge.listen();
   const transport = new StdioServerTransport();
