@@ -445,8 +445,35 @@ function errorResult(e) {
   return { isError: true, content: [{ type: 'text', text: e && e.message ? e.message : String(e) }] };
 }
 
+const MIME = {
+  pdf: 'application/pdf', doc: 'application/msword', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xls: 'application/vnd.ms-excel', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  ppt: 'application/vnd.ms-powerpoint', pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  txt: 'text/plain', csv: 'text/csv', json: 'application/json', html: 'text/html', xml: 'application/xml', rtf: 'application/rtf',
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml', bmp: 'image/bmp',
+  mp3: 'audio/mpeg', wav: 'audio/wav', mp4: 'video/mp4', mov: 'video/quicktime', webm: 'video/webm', zip: 'application/zip',
+};
+const MAX_UPLOAD = 50 * 1024 * 1024;
+
+/** upload_file: the extension can't read local files, so the server sends their contents. */
+function readUploadFiles({ paths }) {
+  const list = Array.isArray(paths) ? paths : paths ? [paths] : [];
+  let total = 0;
+  const files = list.map((p) => {
+    const full = path.resolve(String(p));
+    let st;
+    try { st = statSync(full); } catch (_) { throw new Error(`File not found: ${full}`); }
+    if (!st.isFile()) throw new Error(`Not a file: ${full}`);
+    total += st.size;
+    if (total > MAX_UPLOAD) throw new Error(`The files are larger than ${MAX_UPLOAD / 1024 / 1024} MB in total.`);
+    const ext = path.extname(full).slice(1).toLowerCase();
+    return { name: path.basename(full), type: MIME[ext] || '', lastModified: Math.round(st.mtimeMs), data: readFileSync(full).toString('base64') };
+  });
+  return { files };
+}
+
 /** Register a tool that is forwarded to the extension. */
-function browserTool(name, description, shape, { timeout, annotations } = {}) {
+function browserTool(name, description, shape, { timeout, annotations, prepare } = {}) {
   mcp.registerTool(
     name,
     { description, inputSchema: { ...shape, profile: profileArg }, annotations },
@@ -455,6 +482,7 @@ function browserTool(name, description, shape, { timeout, annotations } = {}) {
       try {
         const conn = await bridge.getConn(profile);
         const ms = typeof timeout === 'function' ? timeout(params) : timeout || 60000;
+        if (prepare) Object.assign(params, await prepare(params));
         const result = await bridge.call(conn, name, params, ms);
         return toContent(result, conn);
       } catch (e) {
@@ -564,7 +592,7 @@ browserTool('screenshot', 'Capture a screenshot of the viewport (default), the f
 }, { timeout: 60000, annotations: RO });
 
 // --- interaction
-browserTool('click', 'Click an element (by ref or selector) or a viewport point (x,y in CSS px) with a real mouse event. Reports navigation, new tabs and dialogs that result.', {
+browserTool('click', 'Click an element (by ref or selector) or a viewport point (x,y in CSS px): pointer and mouse events on the element under the point, then the click. Reports navigation, new tabs and dialogs that result.', {
   ref: refArg,
   selector: selectorArg,
   x: z.number().optional().describe('Viewport x in CSS px (use with y when no ref/selector).'),
@@ -581,7 +609,7 @@ browserTool('hover', 'Move the mouse over an element or point (to reveal menus/t
   tabId: tabIdArg,
 }, { annotations: ACT });
 
-browserTool('drag', 'Drag from one element/point to another with real mouse events.', {
+browserTool('drag', 'Drag from one element/point to another (mouse events, and HTML drag-and-drop when the source is draggable).', {
   fromRef: z.string().optional(), fromSelector: z.string().optional(), fromX: z.number().optional(), fromY: z.number().optional(),
   toRef: z.string().optional(), toSelector: z.string().optional(), toX: z.number().optional(), toY: z.number().optional(),
   tabId: tabIdArg,
@@ -619,13 +647,13 @@ browserTool('scroll', 'Scroll with the mouse wheel. With only ref/selector: scro
   tabId: tabIdArg,
 }, { annotations: ACT });
 
-browserTool('upload_file', 'Set local file(s) on an <input type="file"> (absolute paths on this computer).', {
+browserTool('upload_file', 'Set local file(s) on an <input type="file"> (absolute paths on this computer, up to 50 MB in total).', {
   paths: z.union([z.string(), z.array(z.string())]).describe('Absolute file path(s).'),
   ref: refArg, selector: selectorArg,
   tabId: tabIdArg,
-}, { annotations: ACT });
+}, { timeout: 120000, annotations: ACT, prepare: readUploadFiles });
 
-browserTool('handle_dialog', 'Accept or dismiss a JavaScript alert/confirm/prompt/beforeunload dialog that is blocking the tab.', {
+browserTool('handle_dialog', 'Choose how the NEXT JavaScript confirm/prompt on the tab is answered. Dialogs never stay open: the bridge answers them at once (alert: OK; confirm/prompt: Cancel unless set here) and reports them after the action. To accept one, call this with accept: true, then repeat the action.', {
   accept: z.boolean().optional().describe('true = OK/accept (default), false = Cancel/dismiss.'),
   promptText: z.string().optional().describe('Text to enter for prompt() dialogs.'),
   tabId: tabIdArg,
@@ -640,13 +668,13 @@ browserTool('wait_for', 'Wait until text appears/disappears or a selector become
 }, { timeout: (p) => Math.max(p.timeoutMs || 15000, p.time || 0) + 15000, annotations: RO });
 
 // --- developer tools
-browserTool('evaluate', 'Run JavaScript in the page (main world, bypasses CSP) and return the JSON-serializable result. Supports top-level await; multi-statement code may use "return". Use for reading data or actions other tools can\'t do.', {
+browserTool('evaluate', 'Run JavaScript in the page (main world) and return the JSON-serializable result. Supports top-level await; multi-statement code may use "return". Pages whose CSP forbids eval need "Allow User Scripts" turned on for the extension. Use for reading data or actions other tools can\'t do.', {
   expression: z.string().describe('JavaScript expression or statements.'),
   tabId: tabIdArg,
   timeoutMs: z.number().int().optional().describe('Default 30000.'),
 }, { timeout: (p) => (p.timeoutMs || 30000) + 10000, annotations: ACT });
 
-browserTool('console_messages', 'Get console messages, uncaught exceptions and navigations captured on the tab (capture starts the first time the agent touches the tab).', {
+browserTool('console_messages', 'Get console messages, uncaught exceptions, dialogs and navigations captured on the tab (capture starts when a session takes the tab).', {
   level: z.string().optional().describe('Filter: log, info, warning, error, debug, exception, navigation.'),
   clear: z.boolean().optional().describe('Clear the buffer after reading.'),
   limit: z.number().int().optional().describe('Max messages (default 100, newest last).'),

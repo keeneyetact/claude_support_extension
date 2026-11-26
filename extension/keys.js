@@ -1,4 +1,4 @@
-// Key definitions for CDP Input.dispatchKeyEvent.
+// Key definitions for the KeyboardEvents the page helper (content/agent.js) dispatches.
 
 const MOD_BITS = { Alt: 1, Control: 2, Meta: 4, Shift: 8 };
 
@@ -85,17 +85,24 @@ export function parseCombo(combo) {
   return { modifiers, key: keyName };
 }
 
-export function modifierBits(mods) {
-  return (mods || []).reduce((b, m) => b | (MOD_BITS[normalizeName(m)] || 0), 0);
+const FLAG = { Control: 'ctrl', Shift: 'shift', Alt: 'alt', Meta: 'meta' };
+
+/**
+ * "Control+Shift+K" -> what content/agent.js pressKey needs: the key, the modifier keys to hold
+ * (each pressed and released around it), and the modifier flags for the events.
+ */
+export function comboEvent(combo) {
+  const { modifiers, key } = parseCombo(combo);
+  const def = keyDef(key, modifiers.includes('Shift'));
+  const mods = modifiers.map((m) => ({ ...keyDef(m), location: 1, flag: FLAG[m] }));
+  const flags = {};
+  for (const m of modifiers) flags[FLAG[m]] = true;
+  return { def, mods, modifiers: flags };
 }
 
-// macOS editing shortcuts need explicit commands when dispatched through CDP.
-const MAC_COMMANDS = { a: 'selectAll', c: 'copy', x: 'cut', v: 'paste', z: 'undo' };
-export function macCommands(modifiers, key) {
-  if (modifiers.length === 1 && modifiers[0] === 'Meta' && key.length === 1) {
-    const c = MAC_COMMANDS[key.toLowerCase()];
-    if (c) return [c];
-  }
-  if (modifiers.length === 2 && modifiers.includes('Meta') && modifiers.includes('Shift') && key.toLowerCase() === 'z') return ['redo'];
-  return undefined;
+/** ['Control', 'Shift'] -> { ctrl: true, shift: true } for mouse events. */
+export function modifierFlags(mods) {
+  const flags = {};
+  for (const m of mods || []) flags[FLAG[normalizeName(m)]] = true;
+  return flags;
 }

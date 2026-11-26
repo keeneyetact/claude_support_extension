@@ -1,6 +1,5 @@
 // Service worker: maintains WebSocket connections to local Claude bridge servers and runs their commands.
-import { handleCommand, releaseSession, configure, ownerOf } from './commands.js';
-import { detachAll, attachedTabIds } from './cdp.js';
+import { handleCommand, releaseSession, configure, ownerOf, onPageEvents, releaseAllTabs, controlledTabIds } from './commands.js';
 
 const PROTOCOL_VERSION = 1;
 const DEFAULTS = {
@@ -448,7 +447,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           serverCommand: await bestServerCommand(),
           ports: ports(),
           sessions,
-          attachedTabs: attachedTabIds().length,
+          controlledTabs: controlledTabIds().length,
           activity,
         };
       }
@@ -487,8 +486,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         closeAll('manual reconnect');
         scan();
         return { ok: true };
+      case 'pageEvents':
+        // console output, dialogs and blocked popups from a controlled tab (pagehook.js)
+        return onPageEvents(msg, sender);
       case 'detachAll': {
-        const n = await detachAll();
+        const n = releaseAllTabs();
         logActivity(null, { method: 'release-tabs', ok: true, detail: `${n} tab(s)` });
         return { ok: true, count: n };
       }

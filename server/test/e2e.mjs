@@ -52,12 +52,16 @@ const PAGE = `<!doctype html><html><head><title>Bridge Test Page</title>
 <input type="file" id="file" onchange="document.getElementById('out').textContent='file: '+this.files[0].name">
 <textarea id="ta"></textarea>
 <div id="keys">no key</div>
+<form id="f" onsubmit="event.preventDefault(); document.getElementById('out').textContent='submitted '+this.q.value"><input name="q" id="q" aria-label="Search box"></form>
+<button id="pop" onclick="window.open('/second?popup')">Popup</button>
+<iframe id="xo" src="XORIGIN/frame" style="height:60px"></iframe>
+<script>addEventListener('message', (e) => { if (e.data === 'xo clicked') document.getElementById('out').textContent = 'xo clicked'; });</script>
 <iframe srcdoc="<button onclick=&quot;this.textContent='frame ok'&quot;>Frame button</button>" style="height:60px"></iframe>
 <my-widget></my-widget>
 <div id="spacer"></div>
 <div id="bottom">Bottom of page</div>
 <script>
-document.addEventListener('keydown', e => { if (e.key==='Escape') document.getElementById('keys').textContent='escape pressed'; });
+document.addEventListener('keydown', e => { if (e.key==='Escape') document.getElementById('keys').textContent='escape pressed '+e.keyCode; });
 customElements.define('my-widget', class extends HTMLElement { constructor(){ super(); const r=this.attachShadow({mode:'closed'}); r.innerHTML='<button>Shadow button</button>'; r.querySelector('button').onclick=()=>{ r.querySelector('button').textContent='shadow ok'; }; } });
 setTimeout(()=>{ const d=document.createElement('div'); d.id='late'; d.textContent='Late content'; document.body.appendChild(d); }, 1500);
 console.error('test error message');
@@ -109,8 +113,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function main() {
   const site = http.createServer((req, res) => {
+    if (req.url.startsWith('/csp')) {
+      res.writeHead(200, { 'content-type': 'text/html', 'content-security-policy': "script-src 'self'" });
+      return res.end('<title>CSP</title><h1>Strict page</h1>');
+    }
     res.writeHead(200, { 'content-type': 'text/html' });
-    res.end(req.url.startsWith('/second') ? '<title>Second</title><h1>Second page</h1>' : PAGE);
+    if (req.url.startsWith('/frame')) return res.end('<button onclick="parent.postMessage(\'xo clicked\', \'*\')" style="width:200px;height:40px">Cross button</button>');
+    res.end(req.url.startsWith('/second') ? '<title>Second</title><h1>Second page</h1>' : PAGE.replace('XORIGIN', `http://localhost:${site.address().port}`));
   });
   await new Promise((r) => site.listen(0, '127.0.0.1', r));
   const base = `http://127.0.0.1:${site.address().port}`;
@@ -220,7 +229,7 @@ async function main() {
     r = await call('find', { query: 'Frame button' });
     const frameRef = (/\[ref=(e\d+)\]/.exec(text(r)) || [])[1];
     r = await call('click', { ref: frameRef });
-    r = await call('evaluate', { expression: 'document.querySelector("iframe").contentDocument.querySelector("button").textContent' });
+    r = await call('evaluate', { expression: 'document.querySelector("iframe[srcdoc]").contentDocument.querySelector("button").textContent' });
     check('click inside same-origin iframe', text(r) === 'frame ok', text(r));
 
     r = await call('find', { query: 'Shadow button' });
@@ -231,7 +240,22 @@ async function main() {
 
     r = await call('press_key', { keys: 'Escape' });
     r = await call('get_text', { selector: '#keys' });
-    check('press_key Escape', /escape pressed/.test(text(r)), text(r));
+    check('press_key Escape (with keyCode)', /escape pressed 27/.test(text(r)), text(r));
+
+    r = await call('type', { selector: '#q', text: 'hello', submit: true });
+    r = await call('get_text', { selector: '#out' });
+    check('Enter submits the form', /submitted hello/.test(text(r)), text(r));
+
+    r = await call('screenshot');
+    r = await call('scroll', { selector: '#xo' });
+    r = await call('find', { query: 'xo' });
+    r = await call('evaluate', { expression: 'const f = document.getElementById("xo").getBoundingClientRect(); return [f.left + 40, f.top + 20]' });
+    const [fx, fy] = JSON.parse(text(r));
+    r = await call('click', { x: fx, y: fy });
+    r = await call('get_text', { selector: '#out' });
+    check('click inside a cross-origin iframe', /xo clicked/.test(text(r)), text(r));
+    r = await call('screenshot', { selector: '#xo', format: 'png' });
+    check('element screenshot of the frame', !!(r.content || []).find((c) => c.type === 'image'), text(r));
 
     r = await call('type', { selector: '#ta', text: 'abc', slowly: true });
     r = await call('press_key', { keys: ['Control+a', 'Backspace'] });
@@ -278,13 +302,26 @@ async function main() {
     r = await call('find', { query: 'Confirm me' });
     const confirmRef = (/\[ref=(e\d+)\]/.exec(text(r)) || [])[1];
     r = await call('click', { ref: confirmRef });
-    check('click reports dialog', /dialog/.test(text(r)), text(r));
+    check('click reports dialog', /confirm dialog: "Sure\?"\. It was answered Cancel/.test(text(r)), text(r));
     r = await call('snapshot');
-    check('blocked while dialog open', r.isError && /handle_dialog/.test(text(r)), text(r));
-    r = await call('handle_dialog', { accept: false });
-    check('handle_dialog', /Dismissed confirm/.test(text(r)), text(r));
+    check('a dialog never blocks the tab', !r.isError, text(r));
     r = await call('get_text', { selector: '#out' });
-    check('dialog result', /cancelled/.test(text(r)), text(r));
+    check('unanswered confirm is cancelled', /cancelled/.test(text(r)), text(r));
+    r = await call('handle_dialog', { accept: true });
+    check('handle_dialog sets the next answer', /already answered Cancel/.test(text(r)) && /answered OK/.test(text(r)), text(r));
+    r = await call('click', { ref: confirmRef });
+    check('click reports the preset answer', /answered as you asked with handle_dialog: OK/.test(text(r)), text(r));
+    r = await call('get_text', { selector: '#out' });
+    check('dialog accepted', /confirmed/.test(text(r)), text(r));
+    r = await call('console_messages', { level: 'dialog' });
+    check('console_messages lists dialogs', /confirm\("Sure\?"\) -> OK/.test(text(r)), text(r));
+
+    // window.open from a click: Chrome blocks it (no user activation); the bridge opens a tab instead
+    r = await call('click', { selector: '#pop' });
+    await sleep(500);
+    r = await call('tabs_list');
+    const popTab = (/\[tab (\d+)\] Second — \S+\?popup/.exec(text(r)) || [])[1];
+    check('blocked window.open opens a tab', !!popTab, text(r));
 
     // new tab from target=_blank
     r = await call('find', { query: 'Open second' });
@@ -313,6 +350,18 @@ async function main() {
     r = await call('snapshot', { interactiveOnly: true });
     const newNameRef = refOf(text(r), /textbox "Your name"/);
     check('refs keep counting across navigations', newNameRef && newNameRef !== nameRef, `${nameRef} vs ${newNameRef}`);
+
+    // evaluate on a page whose CSP forbids eval: needs "Allow User Scripts"
+    r = await call('navigate', { url: base + '/csp' });
+    r = await call('evaluate', { expression: '1 + 1' });
+    check('evaluate on a strict-CSP page explains Allow User Scripts', r.isError && /Allow User Scripts/.test(text(r)), text(r));
+    await browser.evaluate(extPage, `chrome.developerPrivate.updateExtensionConfiguration({ extensionId: ${JSON.stringify(extId)}, userScriptsAccess: true })`).catch(() => {});
+    r = await call('evaluate', { expression: '1 + 1' });
+    check('evaluate on a strict-CSP page with user scripts allowed', text(r) === '2', text(r));
+    r = await call('evaluate', { expression: 'const a = 2; return a * 21;' });
+    check('user-scripts evaluate with return', text(r) === '42', text(r));
+    r = await call('evaluate', { expression: 'await new Promise(r => setTimeout(() => r([1, 2]), 20))' });
+    check('user-scripts evaluate with await', /1,\s*2/.test(text(r).replace(/\n/g, '')), text(r));
 
     r = await call('navigate', { url: 'chrome://settings' });
     r = await call('snapshot');

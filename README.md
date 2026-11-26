@@ -5,7 +5,7 @@ Lets a **Claude Code** agent see and control your **real Chrome profiles**: your
 ```
 Claude Code ──stdio(MCP)──► server/index.js ──ws://127.0.0.1:18765──► Chrome extension (in each profile)
                                                                           │
-                                                       chrome.debugger (CDP) + chrome.scripting
+                                          chrome.scripting + chrome.tabs (no chrome.debugger)
 ```
 
 * **`extension/`** is a Manifest V3 Chrome extension. Install it in every Chrome profile you want Claude to use. Its service worker connects *out* to the local bridge and runs the commands.
@@ -94,21 +94,37 @@ Just ask Claude, for example:
 | `find` | Search visible elements by label or text and get their refs |
 | `get_text` | Page or element text, paginated |
 | `screenshot` | Viewport, full page or a single element, scaled so the reported coordinates are usable for clicks |
-| `click`, `hover`, `drag` | Real (trusted) mouse events, by ref, CSS selector or x/y |
-| `type`, `press_key` | Real keyboard input: insert text or type key by key, with combos like `Control+A` |
+| `click`, `hover`, `drag` | Mouse input by ref, CSS selector or x/y: pointer and mouse events on the element under the point (HTML drag and drop too) |
+| `type`, `press_key` | Keyboard input: insert text or type key by key, with combos like `Control+A`. Enter, Tab, Backspace, arrows and select-all behave as they do for a person |
 | `select_option` | Pick options in native `<select>` elements |
 | `scroll` | Mouse-wheel scrolling (also inside nested scroll areas), or scroll an element into view |
-| `upload_file` | Set local files on `<input type=file>` |
-| `handle_dialog` | Accept or dismiss `alert` / `confirm` / `prompt` / `beforeunload` |
+| `upload_file` | Set local files on `<input type=file>` (the server reads them; up to 50 MB) |
+| `handle_dialog` | Choose the answer for the next `confirm` / `prompt` (dialogs are answered at once, so they never freeze the tab) |
 | `wait_for` | Wait for text or a selector to appear or disappear, or for a set time |
-| `evaluate` | Run JavaScript in the page (bypasses CSP; supports `await` and `return`) |
-| `console_messages` | Console logs, errors and navigations captured on the tab |
+| `evaluate` | Run JavaScript in the page (supports `await` and `return`). Pages whose CSP forbids `eval` need *Allow User Scripts* (see below) |
+| `console_messages` | Console logs, errors, dialogs and navigations captured on the tab |
 | `extension_reload` | Reload an unpacked extension from disk after editing it (lists unpacked extensions when no name is given). Needs the `management` permission |
 
 It also handles:
-* Same-origin iframes and open **and closed** shadow DOM, both in snapshots and for clicking.
+* Same-origin iframes and open **and closed** shadow DOM, both in snapshots and for clicking. Clicks and typing also reach into cross-origin iframes.
 * Refs that stay unique across navigations, so a stale ref is reported as an error instead of matching the wrong element.
-* Clicks that open new tabs or dialogs. Claude is told what happened.
+* Clicks that open new tabs, popups or dialogs. Claude is told what happened.
+
+### No debugger
+
+The bridge doesn't use `chrome.debugger`, so Chrome never shows the *"started debugging this browser"* bar and nothing conflicts with DevTools. Instead:
+
+* **Mouse and keyboard** are DOM events dispatched to the element under the point or the focused element. What the browser would do next is done by hand: focus and caret placement on click, typing through `execCommand('insertText')` (React, Vue, Angular and rich-text editors all accept it), Enter submitting forms, Tab moving focus, wheel scrolling the right container.
+* **Links** that open in a new tab, and `window.open` popups, are opened by the extension, because Chrome's popup blocker refuses them without a real click. Same-tab links are navigated by the extension too, so the page stays in Back history.
+* **Screenshots** use `chrome.tabs.captureVisibleTab`. Full-page shots are stitched while scrolling, with fixed headers shown once.
+* **Dialogs** (`alert`, `confirm`, `prompt`) are answered at once by a small script in the page, and reported to Claude: `alert` gets OK, while `confirm` and `prompt` get Cancel unless Claude called `handle_dialog` first. So a dialog can never freeze the tab, and nothing is confirmed without Claude deciding to.
+* **`evaluate`** runs in the page's own JavaScript. Most pages allow it. Pages with a strict Content-Security-Policy refuse code strings, and on those it needs **Allow User Scripts**: `chrome://extensions` → *Claude Browser Bridge* → *Details* → turn on *Allow User Scripts*. Every other tool works without it.
+
+The events are synthetic (`isTrusted` is `false`), and that has limits a person at the keyboard doesn't have:
+
+* A few sites ignore synthetic input on purpose (some anti-bot checks, some games and canvas apps). Claude can often still use them through `evaluate` or by clicking a different element.
+* Things that need a real gesture don't happen: native `<select>` pop-ups (use `select_option`), file pickers (use `upload_file`), paste from the clipboard (type the text instead), fullscreen, and "Sign in with…" popups that need to talk back to the page that opened them.
+* Pages Claude visited are skipped by Chrome's own Back button, because they never got a real click. Claude's `navigate back` isn't affected.
 
 ### One tab per Claude session
 
@@ -153,7 +169,7 @@ To give a session a nicer name, add `--env CHROME_BRIDGE_SESSION_NAME=<name>` to
   * Add `--env CHROME_BRIDGE_TOKEN=<random string>` to the `claude mcp add` command.
   * Enter the same string in the extension's *Settings → Shared token*.
   * Both sides then prove they know the token through an HMAC challenge/response, and the token itself is never sent.
-* While Claude controls a tab, Chrome shows its standard **"Claude Browser Bridge started debugging this browser"** bar. That bar is your signal that the agent is in control. *Release all tabs* in the popup detaches the debugger, and the switch in the popup turns the bridge off for that profile.
+* A tab that Claude controls has a coloured frame and a *Claude is controlling this tab* label (see *One tab per Claude session*). *Release all tabs* in the popup makes every session let go of its tab and gives the pages their own console and dialogs back. The switch in the popup turns the bridge off for that profile.
 * The dashboard shows each session's tab and every command it ran.
 
 Chrome doesn't let any extension control `chrome://` pages, the Chrome Web Store or other extensions' pages.
@@ -191,6 +207,7 @@ The server and the extension share a version. Bump it in `server/package.json` a
   * Open the extension popup. It should say *Connected to N Claude session(s)*.
   * If it says *Waiting…*, make sure the bridge is switched on in the popup and the port ranges match.
   * Make sure `/mcp` in Claude Code shows chrome-bridge as running.
-* **"Another debugger is attached"**: close DevTools on that tab.
-* **Screenshots of background tabs**: Chrome doesn't draw hidden tabs. The bridge briefly brings the tab to the front, takes the screenshot, and switches back.
+* **Screenshots of background tabs**: Chrome only draws the active tab of a window. The bridge briefly brings the tab to the front, takes the screenshot, and switches back. A minimized window can't be captured: restore it first.
+* **"Content-Security-Policy blocks running JavaScript from a string"** from `evaluate`: turn on *Allow User Scripts* for the extension (see *No debugger*).
+* **A click does nothing on one particular site**: the site may ignore synthetic events. Ask Claude to try the element's label or parent, `press_key` Enter on it, or `evaluate` (for example `element.click()`).
 * **The extension seems asleep**: the service worker keeps itself alive and rescans every 3 s, and a 30 s alarm wakes it after Chrome restarts.

@@ -403,7 +403,7 @@ async function refresh() {
   renderSessions(st);
 
   $('profileInfo').textContent = `Shown to Claude as "${st.label}"${st.email && st.email !== st.label ? ` (${st.email})` : ''} · id ${st.profileId.slice(0, 8)}` +
-    (st.attachedTabs ? ` · debugger attached to ${st.attachedTabs} tab(s)` : '');
+    (st.controlledTabs ? ` · controlling ${st.controlledTabs} tab(s)` : '');
 
   if (!formFilled) {
     $('profileLabel').value = st.settings.profileLabel || '';

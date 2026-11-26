@@ -1,11 +1,19 @@
 // Command handlers invoked by the local MCP server. Each returns { text, images? }.
-import {
-  cdp, ensureAttached, sessionFor, withTimeout, mouseClick, mouseMove, mouseWheel, mouseDrag,
-} from './cdp.js';
-import { keyDef, parseCombo, modifierBits, macCommands } from './keys.js';
+// No chrome.debugger: input is dispatched as DOM events by content/agent.js, screenshots come from
+// chrome.tabs.captureVisibleTab, and pagehook.js watches console output and dialogs in the page.
+import { comboEvent, modifierFlags } from './keys.js';
+import { pageHook, pageRelay, pageUnhook } from './pagehook.js';
 
-const AGENT_VERSION = 6; // must match VERSION in content/agent.js
+const AGENT_VERSION = 7; // must match VERSION in content/agent.js
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+export function withTimeout(promise, ms, message) {
+  let t;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => { t = setTimeout(() => reject(new Error(message || `Timed out after ${ms} ms`)), ms); }),
+  ]).finally(() => clearTimeout(t));
+}
 
 let isMac = false;
 chrome.runtime.getPlatformInfo().then((p) => { isMac = p.os === 'mac'; }).catch(() => {});
@@ -59,6 +67,84 @@ async function setIndicatorHidden(tabId, hidden) {
   }), 1000, 'indicator').catch(() => {});
 }
 
+// ------------------------------------------------------------------ console, dialogs, popups
+// Each controlled tab gets pagehook.js in every frame: it records console output, answers
+// alert/confirm/prompt (so a dialog never freezes the tab) and reports blocked popups.
+
+const MAX_LOG = 500;
+/** tabId -> { channel, console: [], dialogs: [], policy: { next } } */
+const tabState = new Map();
+
+function stateFor(tabId) {
+  let st = tabState.get(tabId);
+  if (!st) {
+    const rnd = new Uint8Array(12);
+    crypto.getRandomValues(rnd);
+    st = { channel: 'claude-bridge-' + [...rnd].map((b) => b.toString(16).padStart(2, '0')).join(''), console: [], dialogs: [], policy: { next: null } };
+    tabState.set(tabId, st);
+  }
+  return st;
+}
+
+function pushLog(st, entry) {
+  st.console.push(entry);
+  if (st.console.length > MAX_LOG) st.console.splice(0, st.console.length - MAX_LOG);
+}
+
+/** Inject the console/dialog hook (page world) and its relay (extension world). */
+async function instrument(tabId, frameId) {
+  const st = stateFor(tabId);
+  const target = frameId == null ? { tabId, allFrames: true } : { tabId, frameIds: [frameId] };
+  await Promise.all([
+    chrome.scripting.executeScript({ target, world: 'ISOLATED', injectImmediately: true, func: pageRelay, args: [st.channel] }),
+    chrome.scripting.executeScript({ target, world: 'MAIN', injectImmediately: true, func: pageHook, args: [st.channel, st.policy] }),
+  ]).catch(() => { /* restricted page, error page, frame gone */ });
+}
+
+function uninstrument(tabId) {
+  const st = tabState.get(tabId);
+  if (!st) return;
+  chrome.scripting.executeScript({ target: { tabId, allFrames: true }, world: 'MAIN', func: pageUnhook, args: [st.channel] }).catch(() => {});
+}
+
+// Hook each new document of a controlled tab as early as possible.
+chrome.webNavigation.onCommitted.addListener((d) => {
+  if (!tabOwner.has(d.tabId)) return;
+  instrument(d.tabId, d.frameId);
+  if (d.frameId === 0) pushLog(stateFor(d.tabId), { time: Date.now(), level: 'navigation', text: `Navigated to ${d.url}`, source: '' });
+});
+
+/** Messages from pageRelay (routed here by background.js). */
+export async function onPageEvents(msg, sender) {
+  const tabId = sender.tab && sender.tab.id;
+  const st = tabId != null ? tabState.get(tabId) : null;
+  if (!st || msg.channel !== st.channel || !Array.isArray(msg.entries)) return { ok: false };
+  for (const e of msg.entries.slice(0, 200)) {
+    if (!e || typeof e !== 'object') continue;
+    if (e.kind === 'console') {
+      pushLog(st, { time: Number(e.time) || Date.now(), level: String(e.level || 'log'), text: String(e.text || '').slice(0, 10000), source: String(e.source || '') });
+    } else if (e.kind === 'dialog') {
+      const d = { time: Date.now(), type: String(e.type), message: String(e.message || '').slice(0, 2000), accepted: !!e.accepted, promptText: e.promptText, preset: !!e.preset, frame: msg.top ? '' : String(msg.url || '') };
+      st.dialogs.push(d);
+      if (st.dialogs.length > 20) st.dialogs.shift();
+      if (e.preset) st.policy = { next: null };
+      pushLog(st, { time: d.time, level: 'dialog', text: `${d.type}("${d.message}") -> ${d.accepted ? 'OK' : 'Cancel'}`, source: String(msg.url || '') });
+    } else if (e.kind === 'popup' && tabOwner.has(tabId) && /^https?:/i.test(String(e.url))) {
+      // window.open from a synthetic click is blocked by Chrome; open the page in a tab instead.
+      const tab = await chrome.tabs.get(tabId).catch(() => null);
+      if (tab) await openFrom(tab, String(e.url), true);
+    }
+  }
+  return { ok: true };
+}
+
+function dialogNote(d) {
+  const where = d.frame ? ` (in frame ${d.frame})` : '';
+  if (d.type === 'alert') return `The page showed an alert${where}: "${d.message}" (closed with OK).`;
+  if (d.preset) return `The page showed a ${d.type} dialog${where}: "${d.message}". It was answered as you asked with handle_dialog: ${d.accepted ? 'OK' : 'Cancel'}${d.type === 'prompt' && d.accepted ? ` with "${d.promptText}"` : ''}.`;
+  return `The page showed a ${d.type} dialog${where}: "${d.message}". It was answered Cancel, so nothing it asked for happened. To answer OK, call handle_dialog with accept: true${d.type === 'prompt' ? ' (and promptText)' : ''}, then repeat the action.`;
+}
+
 // A navigation wipes the page, so re-add the marker once the new page has loaded.
 chrome.tabs.onUpdated.addListener((tabId, info) => {
   if (info.status === 'complete' && tabOwner.has(tabId)) showIndicator(tabId);
@@ -71,6 +157,7 @@ function setAgentTab(ctx, tabId) {
     tabOwner.delete(old);
     clearTabBadge(old);
     removeIndicator(old);
+    uninstrument(old);
   }
   ctx.currentTabId = tabId;
   if (tabId != null) {
@@ -82,8 +169,22 @@ function setAgentTab(ctx, tabId) {
     tabOwner.set(tabId, ctx);
     setTabBadge(tabId, ctx);
     showIndicator(tabId);
+    instrument(tabId);
   }
   if (ctx.onChange) ctx.onChange();
+}
+
+/** Tabs some session controls right now. */
+export function controlledTabIds() {
+  return [...tabOwner.keys()];
+}
+
+/** "Release all tabs" in the popup: every session lets go of its tab, and the pages go back to normal. */
+export function releaseAllTabs() {
+  const owners = new Set(tabOwner.values());
+  const n = tabOwner.size;
+  for (const ctx of owners) setAgentTab(ctx, null);
+  return n;
 }
 
 /** Called when a session disconnects: its tab becomes free again. */
@@ -125,7 +226,20 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     if (owner.onChange) owner.onChange();
   }
   refCounters.delete(tabId);
+  tabState.delete(tabId);
 });
+
+/** Open a page in a new tab next to `tab`, on behalf of that tab (settle() reports it). */
+async function openFrom(tab, url, active) {
+  const t = await chrome.tabs.create({ url, openerTabId: tab.id, index: tab.index + 1, active }).catch(() => null);
+  // Chrome sets openerTabId on extension-created tabs only after onCreated, so record it here.
+  if (t) {
+    const rec = recentCreated.find((r) => r.id === t.id);
+    if (rec) rec.opener = tab.id;
+    else recentCreated.push({ id: t.id, opener: tab.id, at: Date.now(), url });
+  }
+  return t;
+}
 
 /** tabId -> highest element ref number issued (refs stay unique across navigations). */
 const refCounters = new Map();
@@ -148,18 +262,6 @@ function checkScriptable(tab) {
 
 function summary(tab) {
   return `[tab ${tab.id}] ${tab.title || '(no title)'} — ${tabUrl(tab)}`;
-}
-
-function dialogError(d) {
-  return new Error(
-    `A JavaScript ${d.type} dialog is open on this tab: "${d.message}". ` +
-    'Call handle_dialog (accept or dismiss) before doing anything else on this tab.',
-  );
-}
-
-function guardDialog(tabId) {
-  const st = sessionFor(tabId);
-  if (st && st.dialog) throw dialogError(st.dialog);
 }
 
 async function resolveTab(ctx, tabId, { takeOver = false } = {}) {
@@ -202,12 +304,12 @@ function friendlyScriptError(e, tab) {
   return e instanceof Error ? e : new Error(msg);
 }
 
-/** Run a method of the in-page helper (content/agent.js) in the tab's top frame. */
-async function page(tab, method, args = {}, timeoutMs = 15000) {
+/** Run a method of the in-page helper (content/agent.js) in one frame of the tab (default: top). */
+async function page(tab, method, args = {}, timeoutMs = 15000, frameId = 0) {
   checkScriptable(tab);
-  guardDialog(tab.id);
+  const target = { tabId: tab.id, frameIds: [frameId] };
   const run = () => chrome.scripting.executeScript({
-    target: { tabId: tab.id },
+    target,
     world: 'ISOLATED',
     func: (m, a, v, c) => {
       const b = window.__claudeBridge;
@@ -220,7 +322,7 @@ async function page(tab, method, args = {}, timeoutMs = 15000) {
     let [res] = await withTimeout(run(), timeoutMs, 'Page did not respond');
     if (res && res.result && res.result.missing) {
       await withTimeout(
-        chrome.scripting.executeScript({ target: { tabId: tab.id }, world: 'ISOLATED', files: ['content/agent.js'] }),
+        chrome.scripting.executeScript({ target, world: 'ISOLATED', files: ['content/agent.js'] }),
         timeoutMs, 'Page did not respond',
       );
       [res] = await withTimeout(run(), timeoutMs, 'Page did not respond');
@@ -232,13 +334,34 @@ async function page(tab, method, args = {}, timeoutMs = 15000) {
     if (!r.ok) throw new Error(r.error);
     return r.value;
   } catch (e) {
-    const st = sessionFor(tab.id);
-    if (st && st.dialog) throw dialogError(st.dialog);
     if (/Page did not respond/.test(e.message)) {
-      throw new Error(`The page did not respond within ${timeoutMs} ms (it may be busy, frozen, or blocked by a dialog). If a dialog is showing, call console_messages or handle_dialog.`);
+      throw new Error(`The page did not respond within ${timeoutMs} ms (it may be busy or frozen).`);
     }
     throw friendlyScriptError(e, tab);
   }
+}
+
+/**
+ * Run an input method of the page helper; when the point (or the focused element) is inside a
+ * cross-origin iframe, repeat it inside that frame, with the point translated to the frame.
+ */
+async function framePage(tab, method, args = {}, timeoutMs = 15000) {
+  let frameId = 0;
+  let a = args;
+  for (let depth = 0; depth < 6; depth++) {
+    const r = await page(tab, method, a, timeoutMs, frameId);
+    if (!r || !r.frame) return r;
+    const frames = (await chrome.webNavigation.getAllFrames({ tabId: tab.id }).catch(() => null)) || [];
+    const kids = frames.filter((f) => f.parentFrameId === frameId);
+    const src = String(r.frame.src || '');
+    const pick = kids.find((f) => f.url === src) || kids.find((f) => src && f.url.split('#')[0] === src.split('#')[0]) ||
+      kids.find((f) => { try { return new URL(f.url).origin === new URL(src).origin; } catch (_) { return false; } }) ||
+      (kids.length === 1 ? kids[0] : null);
+    if (!pick) throw new Error(`The target is inside a cross-origin frame (${src || 'no src'}) that could not be matched to a frame of this tab.`);
+    frameId = pick.frameId;
+    a = r.frame.x != null ? { ...args, x: r.frame.x, y: r.frame.y } : args;
+  }
+  throw new Error('Frames are nested too deeply.');
 }
 
 async function waitForLoad(tabId, timeoutMs = 30000, { expectNavigation = true } = {}) {
@@ -252,8 +375,6 @@ async function waitForLoad(tabId, timeoutMs = 30000, { expectNavigation = true }
     else if (tab.status === 'complete' && (sawLoading || !expectNavigation || Date.now() - start > 1500)) {
       return { ok: true, tab };
     }
-    const st = sessionFor(tabId);
-    if (st && st.dialog) return { ok: false, dialog: st.dialog, tab };
     await sleep(100);
   }
   return { ok: false, timeout: true, tab };
@@ -270,8 +391,8 @@ async function settle(tabId, since, urlBefore) {
     tab = r.tab || tab;
     if (r.timeout) notes.push('Page is still loading (waited 15 s).');
   }
-  const st = sessionFor(tabId);
-  if (st && st.dialog) notes.push(`A JavaScript ${st.dialog.type} dialog opened: "${st.dialog.message}" — call handle_dialog.`);
+  const st = tabState.get(tabId);
+  if (st) for (const d of st.dialogs.filter((x) => x.time >= since)) notes.push(dialogNote(d));
   const opened = recentCreated.filter((r) => r.at >= since && r.opener === tabId);
   for (const o of opened) {
     const t = await chrome.tabs.get(o.id).catch(() => null);
@@ -280,6 +401,31 @@ async function settle(tabId, since, urlBefore) {
   if (urlBefore && tabUrl(tab) !== urlBefore) notes.push(`Navigated to ${tabUrl(tab)}`);
   notes.push(`Current page: ${summary(tab)}`);
   return notes.join('\n');
+}
+
+/**
+ * Back/forward through the page's own history. chrome.tabs.goBack skips entries of pages that
+ * never had a real user gesture, which is every page Claude visits (its input is synthetic).
+ */
+async function historyGo(tab, delta) {
+  let res = null;
+  try {
+    [res] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id }, world: 'ISOLATED',
+      func: (d) => {
+        // Navigation API (Chrome 102+) says whether there is an entry to go to.
+        const nav = window.navigation;
+        if (nav && (d < 0 ? !nav.canGoBack : !nav.canGoForward)) return false;
+        history.go(d);
+        return true;
+      },
+      args: [delta],
+    });
+  } catch (_) {
+    res = null; // restricted page: use the browser's own back/forward
+  }
+  if (res && res.result === false) throw new Error(`Cannot find a ${delta < 0 ? 'previous' : 'next'} page in history.`);
+  if (!res) await (delta < 0 ? chrome.tabs.goBack(tab.id) : chrome.tabs.goForward(tab.id));
 }
 
 function normalizeUrl(url) {
@@ -300,31 +446,11 @@ async function targetPoint(tab, { ref, selector, x, y }, label = 'target') {
 
 // ------------------------------------------------------------------ images
 
-function b64ToBytes(b64) {
-  const bin = atob(b64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return bytes;
-}
-
 function bytesToB64(bytes) {
   let s = '';
   const CHUNK = 0x8000;
   for (let i = 0; i < bytes.length; i += CHUNK) s += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
   return btoa(s);
-}
-
-async function resizeImage(b64, inMime, width, height, outMime, quality) {
-  const bmp = await createImageBitmap(new Blob([b64ToBytes(b64)], { type: inMime }));
-  if (bmp.width === width && bmp.height === height && inMime === outMime) { bmp.close(); return b64; }
-  const canvas = new OffscreenCanvas(width, height);
-  const ctx = canvas.getContext('2d');
-  ctx.imageSmoothingQuality = 'high';
-  if (outMime === 'image/jpeg') { ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, width, height); }
-  ctx.drawImage(bmp, 0, 0, width, height);
-  bmp.close();
-  const blob = await canvas.convertToBlob({ type: outMime, quality: quality / 100 });
-  return bytesToB64(new Uint8Array(await blob.arrayBuffer()));
 }
 
 // ------------------------------------------------------------------ handlers
@@ -389,13 +515,11 @@ const handlers = {
   async navigate({ url, tabId, timeoutMs = 30000 } = {}, ctx) {
     if (!url) throw new Error('url is required (or "back", "forward", "reload").');
     let tab = await resolveTab(ctx, tabId);
-    guardDialog(tab.id);
     const since = Date.now();
     const cmd = String(url).toLowerCase();
     const before = tabUrl(tab);
     try {
-      if (cmd === 'back') await chrome.tabs.goBack(tab.id);
-      else if (cmd === 'forward') await chrome.tabs.goForward(tab.id);
+      if (cmd === 'back' || cmd === 'forward') await historyGo(tab, cmd === 'back' ? -1 : 1);
       else if (cmd === 'reload') await chrome.tabs.reload(tab.id);
       else await chrome.tabs.update(tab.id, { url: normalizeUrl(url) });
     } catch (e) {
@@ -405,7 +529,8 @@ const handlers = {
     tab = r.tab || tab;
     const notes = [];
     if (r.timeout) notes.push(`Page still loading after ${timeoutMs} ms (continuing anyway).`);
-    if (r.dialog) notes.push(`A JavaScript ${r.dialog.type} dialog is open: "${r.dialog.message}" — call handle_dialog.`);
+    const st = tabState.get(tab.id);
+    if (st) for (const d of st.dialogs.filter((x) => x.time >= since)) notes.push(dialogNote(d));
     const opened = recentCreated.filter((o) => o.at >= since && o.opener === tab.id);
     if (opened.length) notes.push(`Page opened ${opened.length} new tab(s).`);
     if (cmd === 'back' || cmd === 'forward') {
@@ -417,72 +542,96 @@ const handlers = {
   async screenshot({ tabId, format = 'jpeg', quality = 80, fullPage = false, ref, selector, maxDimension = 1568 } = {}, ctx) {
     let tab = await resolveTab(ctx, tabId);
     checkScriptable(tab);
-    guardDialog(tab.id);
-    await ensureAttached(tab.id);
     const fmt = format === 'png' ? 'png' : 'jpeg';
     const mime = 'image/' + fmt;
-    const metrics = await cdp(tab.id, 'Page.getLayoutMetrics');
-    const layout = metrics.cssLayoutViewport || metrics.layoutViewport;
-    const visual = metrics.cssVisualViewport || metrics.visualViewport;
-    let cssW = visual.clientWidth, cssH = visual.clientHeight;
-    const params = { format: fmt, captureBeyondViewport: false };
-    if (fmt === 'jpeg') params.quality = Math.max(1, Math.min(100, quality));
-    let mode = 'viewport';
-    let originNote = '';
-    if (ref || selector) {
-      const r = await page(tab, 'rect', { ref, selector });
-      const m2 = await cdp(tab.id, 'Page.getLayoutMetrics');
-      const lv = m2.cssLayoutViewport || m2.layoutViewport;
-      cssW = Math.max(1, Math.ceil(r.width));
-      cssH = Math.max(1, Math.ceil(Math.min(r.height, 8000)));
-      params.clip = { x: r.x + lv.pageX, y: r.y + lv.pageY, width: cssW, height: cssH, scale: 1 };
-      params.captureBeyondViewport = true;
-      mode = 'element';
-      originNote = ` Element ${r.description} at viewport (${Math.round(r.x)}, ${Math.round(r.y)}); image (0,0) = that point.`;
-    } else if (fullPage) {
-      const size = metrics.cssContentSize || metrics.contentSize;
-      cssW = Math.ceil(size.width);
-      cssH = Math.min(Math.ceil(size.height), 16000);
-      params.clip = { x: 0, y: 0, width: cssW, height: cssH, scale: 1 };
-      params.captureBeyondViewport = true;
-      mode = 'full page';
-      originNote = ` Image coordinates are document coordinates (current scroll ${Math.round(layout.pageX)},${Math.round(layout.pageY)}), not viewport coordinates.`;
+    const q = Math.max(1, Math.min(100, quality));
+    const win = await chrome.windows.get(tab.windowId).catch(() => null);
+    if (win && win.state === 'minimized') {
+      throw new Error('The Chrome window with this tab is minimized, so Chrome has nothing to capture. Restore the window (or call tab_select with focusWindow: true), then take the screenshot.');
     }
-
-    let shot;
-    const capture = (ms) => cdp(tab.id, 'Page.captureScreenshot', params, ms);
-    await setIndicatorHidden(tab.id, true);
-    try {
-      shot = await capture(tab.active ? 20000 : 3000);
-    } catch (e) {
-      if (tab.active) throw new Error(`Screenshot failed: ${e.message}`);
-      // Background tabs often don't render; briefly activate the tab, capture, then restore.
+    // Chrome only draws the active tab of a window: switch to it briefly when it is in the background.
+    let restoreTab = null;
+    if (!tab.active) {
       const [prev] = await chrome.tabs.query({ active: true, windowId: tab.windowId });
+      restoreTab = prev && prev.id !== tab.id ? prev.id : null;
       await chrome.tabs.update(tab.id, { active: true });
       await sleep(400);
-      try {
-        shot = await capture(20000);
-      } finally {
-        if (prev && prev.id !== tab.id) await chrome.tabs.update(prev.id, { active: true }).catch(() => {});
+    }
+    await setIndicatorHidden(tab.id, true);
+    let mode = 'viewport', originNote = '', cssW, cssH, canvas, scale;
+    try {
+      const info = await page(tab, 'scrollInfo');
+      const vw = info.viewportWidth, vh = info.viewportHeight;
+      const limitFor = (w, h, full) => {
+        const longest = Math.max(w, h);
+        const limit = full ? Math.max(maxDimension, 8000) : maxDimension;
+        let k = longest > limit ? limit / longest : 1;
+        if (full && w * k > maxDimension) k = Math.min(k, maxDimension / w);
+        return k;
+      };
+      if (ref || selector) {
+        const r = await page(tab, 'rect', { ref, selector });
+        await sleep(120);
+        const bmp = await captureBitmap(tab.windowId);
+        const k = bmp.width / vw; // device pixels per CSS px
+        const x1 = Math.max(0, r.x), y1 = Math.max(0, r.y);
+        const x2 = Math.min(vw, r.x + r.width), y2 = Math.min(vh, r.y + r.height);
+        if (x2 <= x1 || y2 <= y1) { bmp.close(); throw new Error(`Element ${r.description} is not inside the viewport.`); }
+        cssW = Math.ceil(x2 - x1); cssH = Math.ceil(y2 - y1);
+        scale = limitFor(cssW, cssH, false);
+        canvas = new OffscreenCanvas(Math.max(1, Math.round(cssW * scale)), Math.max(1, Math.round(cssH * scale)));
+        draw(canvas, bmp, x1 * k, y1 * k, (x2 - x1) * k, (y2 - y1) * k, 0, 0, canvas.width, canvas.height, fmt);
+        bmp.close();
+        mode = 'element';
+        originNote = ` Element ${r.description} at viewport (${Math.round(r.x)}, ${Math.round(r.y)}); image (0,0) = viewport (${Math.round(x1)}, ${Math.round(y1)}).`;
+        if (r.height > cssH + 1 || r.width > cssW + 1) originNote += ` Only the part inside the viewport (${cssW}x${cssH} of ${Math.round(r.width)}x${Math.round(r.height)}) is captured.`;
+      } else if (fullPage) {
+        cssW = vw;
+        cssH = Math.min(info.height, 16000);
+        scale = limitFor(cssW, cssH, true);
+        canvas = new OffscreenCanvas(Math.max(1, Math.round(cssW * scale)), Math.max(1, Math.round(cssH * scale)));
+        const start = { x: info.x, y: info.y };
+        let hidden = false;
+        try {
+          for (let y = 0, i = 0; i < 60; i++) {
+            const pos = await page(tab, 'scrollToXY', { x: 0, y });
+            if (i === 1) { await page(tab, 'hideFixed'); hidden = true; } // keep sticky headers in the first slice only
+            await sleep(150);
+            const bmp = await captureBitmap(tab.windowId);
+            const top = Math.min(pos.y, cssH);
+            const h = Math.min(vh, cssH - top);
+            if (h > 0) draw(canvas, bmp, 0, 0, bmp.width, (bmp.height * h) / vh, 0, top * scale, cssW * scale, h * scale, fmt);
+            bmp.close();
+            if (pos.y + vh >= cssH || (i > 0 && pos.y < y)) break; // reached the end (or the page can't scroll further)
+            y = pos.y + vh;
+          }
+        } finally {
+          if (hidden) await page(tab, 'restoreFixed').catch(() => {});
+          await page(tab, 'scrollToXY', start).catch(() => {});
+        }
+        mode = 'full page';
+        originNote = ` Image coordinates are document coordinates (current scroll ${Math.round(start.x)},${Math.round(start.y)}), not viewport coordinates. Fixed and sticky elements appear only at the top.`;
+      } else {
+        cssW = vw; cssH = vh;
+        scale = limitFor(cssW, cssH, false);
+        const bmp = await captureBitmap(tab.windowId);
+        canvas = new OffscreenCanvas(Math.max(1, Math.round(cssW * scale)), Math.max(1, Math.round(cssH * scale)));
+        draw(canvas, bmp, 0, 0, bmp.width, bmp.height, 0, 0, canvas.width, canvas.height, fmt);
+        bmp.close();
       }
     } finally {
       setIndicatorHidden(tab.id, false);
+      if (restoreTab != null) await chrome.tabs.update(restoreTab, { active: true }).catch(() => {});
     }
-
-    const longest = Math.max(cssW, cssH);
-    const limit = mode === 'full page' ? Math.max(maxDimension, 8000) : maxDimension;
-    let scale = longest > limit ? limit / longest : 1;
-    if (mode === 'full page' && cssW * scale > maxDimension) scale = Math.min(scale, maxDimension / cssW);
-    const outW = Math.max(1, Math.round(cssW * scale));
-    const outH = Math.max(1, Math.round(cssH * scale));
-    const data = await resizeImage(shot.data, mime, outW, outH, mime, fmt === 'jpeg' ? params.quality : 100);
+    const blob = await canvas.convertToBlob({ type: mime, quality: q / 100 });
+    const data = bytesToB64(new Uint8Array(await blob.arrayBuffer()));
     tab = await chrome.tabs.get(tab.id).catch(() => tab);
     let coordNote;
     if (scale === 1) coordNote = 'Image pixels = CSS pixels.';
     else coordNote = `Image is scaled by ${scale.toFixed(4)}: divide image coordinates by ${scale.toFixed(4)} (i.e. multiply by ${(1 / scale).toFixed(4)}) to get CSS pixels.`;
     if (mode === 'viewport') coordNote += ' Coordinates are viewport coordinates usable for click/hover x,y.';
     return {
-      text: `Screenshot (${mode}) of ${summary(tab)}. Image ${outW}x${outH}, area ${cssW}x${cssH} CSS px. ${coordNote}${originNote}\nPrefer refs from snapshot/find over coordinates when possible.`,
+      text: `Screenshot (${mode}) of ${summary(tab)}. Image ${canvas.width}x${canvas.height}, area ${cssW}x${cssH} CSS px. ${coordNote}${originNote}\nPrefer refs from snapshot/find over coordinates when possible.`,
       images: [{ data, mimeType: mime }],
     };
   },
@@ -506,13 +655,18 @@ const handlers = {
   async click({ tabId, ref, selector, x, y, button = 'left', doubleClick = false, clickCount, modifiers = [] } = {}, ctx) {
     const tab = await resolveTab(ctx, tabId);
     checkScriptable(tab);
-    guardDialog(tab.id);
     const since = Date.now();
     const urlBefore = tabUrl(tab);
     const pt = await targetPoint(tab, { ref, selector, x, y });
-    await mouseClick(tab.id, pt.x, pt.y, {
-      button, clickCount: clickCount || (doubleClick ? 2 : 1), modifiers: modifierBits(modifiers),
+    const r = await framePage(tab, 'clickAt', {
+      x: pt.x, y: pt.y, button, clickCount: clickCount || (doubleClick ? 2 : 1), modifiers: modifierFlags(modifiers),
     });
+    if (r && r.link) {
+      // The page helper cancelled a link's own navigation (see fireClick in content/agent.js): a
+      // new tab would be blocked, and a same-tab one would leave a skippable history entry.
+      if (r.link.newTab) await openFrom(tab, r.link.url, r.link.active);
+      else await chrome.tabs.update(tab.id, { url: r.link.url });
+    }
     const after = await settle(tab.id, since, urlBefore);
     return {
       text: `Clicked ${pt.description} at (${Math.round(pt.x)}, ${Math.round(pt.y)}).` +
@@ -523,9 +677,8 @@ const handlers = {
   async hover({ tabId, ref, selector, x, y } = {}, ctx) {
     const tab = await resolveTab(ctx, tabId);
     checkScriptable(tab);
-    guardDialog(tab.id);
     const pt = await targetPoint(tab, { ref, selector, x, y });
-    await mouseMove(tab.id, pt.x, pt.y);
+    await framePage(tab, 'hoverAt', { x: pt.x, y: pt.y });
     await sleep(300);
     return { text: `Hovering over ${pt.description} at (${Math.round(pt.x)}, ${Math.round(pt.y)}).${pt.warning ? '\nWarning: ' + pt.warning : ''}` };
   },
@@ -533,76 +686,64 @@ const handlers = {
   async drag({ tabId, fromRef, fromSelector, fromX, fromY, toRef, toSelector, toX, toY } = {}, ctx) {
     const tab = await resolveTab(ctx, tabId);
     checkScriptable(tab);
-    guardDialog(tab.id);
     const since = Date.now();
     const urlBefore = tabUrl(tab);
     const a = await targetPoint(tab, { ref: fromRef, selector: fromSelector, x: fromX, y: fromY }, 'drag source');
-    // Compute destination without scrolling it into view if coordinates given.
     const b = await targetPoint(tab, { ref: toRef, selector: toSelector, x: toX, y: toY }, 'drop target');
     // Source may have moved if the destination scrolled; recompute when using refs.
     const a2 = fromRef || fromSelector ? await page(tab, 'point', { ref: fromRef, selector: fromSelector, scroll: false }).catch(() => a) : a;
-    await mouseDrag(tab.id, { x: a2.x, y: a2.y }, { x: b.x, y: b.y });
-    return { text: `Dragged ${a.description} to ${b.description}.\n` + (await settle(tab.id, since, urlBefore)) };
+    const r = await page(tab, 'dragAt', { from: { x: a2.x, y: a2.y }, to: { x: b.x, y: b.y } }, 30000);
+    const how = r.html5 ? (r.dropped ? ' (HTML drag and drop; the target accepted the drop)' : ' (HTML drag and drop; the target did not accept the drop)') : '';
+    return { text: `Dragged ${a.description} to ${b.description}${how}.\n` + (await settle(tab.id, since, urlBefore)) };
   },
 
   async type({ tabId, text, ref, selector, clear = false, submit = false, slowly = false } = {}, ctx) {
     if (typeof text !== 'string') throw new Error('text is required.');
     const tab = await resolveTab(ctx, tabId);
     checkScriptable(tab);
-    guardDialog(tab.id);
     const since = Date.now();
     const urlBefore = tabUrl(tab);
+    const selectAll = isMac ? 'Meta+a' : 'Control+a';
     let desc = 'the focused element';
     if (ref || selector) {
-      let f = await page(tab, 'focus', { ref, selector, clear });
+      const f = await page(tab, 'focus', { ref, selector, clear });
       if (!f.focused) {
         // Not directly focusable (e.g. a wrapper) – click it like a user would.
         const pt = await targetPoint(tab, { ref, selector });
-        await mouseClick(tab.id, pt.x, pt.y);
+        await framePage(tab, 'clickAt', { x: pt.x, y: pt.y });
         await sleep(100);
-        if (clear) {
-          await pressCombo(tab.id, isMac ? 'Meta+a' : 'Control+a');
-          await pressCombo(tab.id, 'Backspace');
-        }
+        if (clear) { await pressCombo(tab, selectAll); await pressCombo(tab, 'Backspace'); }
       } else if (clear && f.hasValue) {
-        // focus() already selected the content; select-all again via keyboard (covers inputs where
-        // select() is unsupported) and delete it so frameworks see a real user edit.
-        await pressCombo(tab.id, isMac ? 'Meta+a' : 'Control+a');
-        await pressCombo(tab.id, 'Backspace');
+        await pressCombo(tab, selectAll);
+        await pressCombo(tab, 'Backspace');
       }
       desc = f.description;
     } else if (clear) {
-      await pressCombo(tab.id, isMac ? 'Meta+a' : 'Control+a');
-      await pressCombo(tab.id, 'Backspace');
+      await pressCombo(tab, selectAll);
+      await pressCombo(tab, 'Backspace');
     }
+    let note = '';
     if (text.length) {
-      if (slowly) {
-        for (const ch of text) {
-          if (ch === '\n') await pressCombo(tab.id, 'Enter');
-          else await typeChar(tab.id, ch);
-          await sleep(30);
-        }
-      } else {
-        await cdp(tab.id, 'Input.insertText', { text });
-      }
+      const r = await framePage(tab, 'typeText', { text, slowly }, 120000);
+      if (r && r.editable === false) note = '\nNote: the focused element is not a text field, so only key events were sent.';
     }
-    if (submit) await pressCombo(tab.id, 'Enter');
+    if (submit) await pressCombo(tab, 'Enter');
     const after = await settle(tab.id, since, urlBefore);
-    return { text: `Typed ${text.length} character(s) into ${desc}${submit ? ' and pressed Enter' : ''}.\n${after}` };
+    return { text: `Typed ${text.length} character(s) into ${desc}${submit ? ' and pressed Enter' : ''}.${note}\n${after}` };
   },
 
   async press_key({ tabId, keys, repeat = 1 } = {}, ctx) {
     if (!keys) throw new Error('keys is required, e.g. "Enter", "Escape", "Control+A", "Shift+Tab".');
     const tab = await resolveTab(ctx, tabId);
     checkScriptable(tab);
-    guardDialog(tab.id);
     const since = Date.now();
     const urlBefore = tabUrl(tab);
     const list = Array.isArray(keys) ? keys : [keys];
+    const notes = new Set();
     for (let i = 0; i < Math.max(1, Math.min(repeat, 200)); i++) {
-      for (const k of list) await pressCombo(tab.id, k);
+      for (const k of list) { const n = await pressCombo(tab, k); if (n) notes.add(n); }
     }
-    return { text: `Pressed ${list.join(', ')}${repeat > 1 ? ` x${repeat}` : ''}.\n` + (await settle(tab.id, since, urlBefore)) };
+    return { text: `Pressed ${list.join(', ')}${repeat > 1 ? ` x${repeat}` : ''}${notes.size ? ` (${[...notes].join('; ')})` : ''}.\n` + (await settle(tab.id, since, urlBefore)) };
   },
 
   async select_option({ tabId, ref, selector, values } = {}, ctx) {
@@ -616,7 +757,6 @@ const handlers = {
   async scroll({ tabId, deltaX, deltaY, ref, selector, x, y } = {}, ctx) {
     const tab = await resolveTab(ctx, tabId);
     checkScriptable(tab);
-    guardDialog(tab.id);
     if ((ref || selector) && deltaX == null && deltaY == null) {
       const d = await page(tab, 'scrollIntoView', { ref, selector });
       const info = await page(tab, 'scrollInfo');
@@ -632,13 +772,13 @@ const handlers = {
     }
     const dx = Number(deltaX || 0);
     const dy = deltaY == null && deltaX == null ? Math.round(before.viewportHeight * 0.8) : Number(deltaY || 0);
-    await mouseWheel(tab.id, px, py, dx, dy);
-    await sleep(400);
+    const r = await framePage(tab, 'wheelAt', { x: px, y: py, dx, dy });
+    await sleep(200);
     const after = await page(tab, 'scrollInfo');
     let text = `Scrolled by (${dx}, ${dy}) at (${Math.round(px)}, ${Math.round(py)}). Page scroll is now ${after.x},${after.y} of ${after.width}x${after.height} (viewport ${after.viewportWidth}x${after.viewportHeight}).`;
-    if (after.x === before.x && after.y === before.y) {
-      text += ' The page scroll position did not change: either a nested scroll container under that point scrolled, or the page is already at its edge.';
-    }
+    if (r && r.prevented) text += ' The page handled the wheel event itself (e.g. a map, carousel or custom scroller).';
+    else if (r && r.scrolled && r.scrolled !== 'page') text += ` The scrollable area ${r.scrolled} scrolled.`;
+    else if (after.x === before.x && after.y === before.y) text += ' Nothing moved: the page (and any scroll area under that point) is already at its edge.';
     return { text };
   },
 
@@ -646,27 +786,8 @@ const handlers = {
     if (!expression) throw new Error('expression is required.');
     const tab = await resolveTab(ctx, tabId);
     checkScriptable(tab);
-    guardDialog(tab.id);
-    // replMode allows top-level await but does not await a returned promise, so wrapped code runs without it.
-    const run = (expr, repl = true) => cdp(tab.id, 'Runtime.evaluate', {
-      expression: expr, awaitPromise: true, returnByValue: true, userGesture: true, replMode: repl, allowUnsafeEvalBlockedByCSP: true,
-    }, timeoutMs);
-    const exc = (x) => x.exceptionDetails && (x.exceptionDetails.exception?.description || x.exceptionDetails.text || 'Error');
-    const asFunctionBody = (src) => `(async () => {\n${src}\n})()`;
-    // Code with a top-level `return` is treated as a function body.
-    const hasTopLevelReturn = /(^|[;{}\n])\s*return\b/.test(expression);
-    let r = hasTopLevelReturn ? await run(asFunctionBody(expression), false) : await run(expression);
-    if (!hasTopLevelReturn && r.exceptionDetails && /Illegal return statement/.test(exc(r))) {
-      r = await run(asFunctionBody(expression), false);
-    }
-    if (r.exceptionDetails) throw new Error('JavaScript error: ' + exc(r));
-    const v = r.result || {};
-    let out;
-    if (v.type === 'undefined') out = 'undefined';
-    else if ('value' in v) out = typeof v.value === 'string' ? v.value : JSON.stringify(v.value, null, 2);
-    else out = v.unserializableValue || v.description || `[${v.type}]`;
-    if (out && out.length > 50000) out = out.slice(0, 50000) + `\n… [truncated, ${out.length} chars total]`;
-    return { text: out };
+    const out = await runInPage(tab.id, String(expression), timeoutMs);
+    return { text: out && out.length > 50000 ? out.slice(0, 50000) + `\n… [truncated, ${out.length} chars total]` : out };
   },
 
   async wait_for({ tabId, text, textGone, selector, selectorGone, time, timeoutMs = 15000 } = {}, ctx) {
@@ -696,12 +817,12 @@ const handlers = {
 
   async console_messages({ tabId, level, clear = false, limit = 100 } = {}, ctx) {
     const tab = await resolveTab(ctx, tabId);
-    const existed = !!sessionFor(tab.id);
-    const st = await ensureAttached(tab.id);
+    const existed = tabState.has(tab.id) && tabState.get(tab.id).console.length > 0;
+    const st = stateFor(tab.id);
     let msgs = st.console;
     if (level) {
       const lv = String(level).toLowerCase();
-      msgs = msgs.filter((m) => m.level === lv || (lv === 'error' && (m.level === 'exception' || m.level === 'error')));
+      msgs = msgs.filter((m) => m.level === lv || (lv === 'error' && (m.level === 'exception' || m.level === 'error')) || (lv === 'warn' && m.level === 'warning'));
     }
     const shown = msgs.slice(-limit);
     const lines = shown.map((m) => {
@@ -710,20 +831,25 @@ const handlers = {
     });
     if (clear) st.console.length = 0;
     let head = `${shown.length} of ${msgs.length} message(s) for ${summary(tab)}`;
-    if (!existed) head += '\nCapturing just started on this tab — earlier messages are not available. Reproduce the action, then call again.';
+    if (!existed && !shown.length) head += '\nCapture starts when a session takes the tab; messages logged before that are not available. Reproduce the action, then call again.';
     return { text: head + (lines.length ? '\n' + lines.join('\n') : '') };
   },
 
   async handle_dialog({ tabId, accept = true, promptText } = {}, ctx) {
     const tab = await resolveTab(ctx, tabId);
-    const st = sessionFor(tab.id);
-    if (!st || !st.dialog) throw new Error('No JavaScript dialog is open on this tab (dialogs are only detected on tabs the agent has interacted with).');
-    const d = st.dialog;
-    const params = { accept: !!accept };
-    if (promptText != null) params.promptText = String(promptText);
-    await cdp(tab.id, 'Page.handleJavaScriptDialog', params);
-    st.dialog = null;
-    return { text: `${accept ? 'Accepted' : 'Dismissed'} ${d.type} dialog "${d.message}".\n` + (await settle(tab.id, Date.now(), null)) };
+    const st = stateFor(tab.id);
+    st.policy = { next: { accept: !!accept, promptText: promptText != null ? String(promptText) : null } };
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id, allFrames: true }, world: 'MAIN', func: pageHook, args: [st.channel, st.policy],
+    }).catch(() => {});
+    const how = accept ? `OK${promptText != null ? ` with "${promptText}"` : ''}` : 'Cancel';
+    const last = st.dialogs[st.dialogs.length - 1];
+    let text = `The next alert/confirm/prompt on this tab will be answered ${how}.`;
+    if (last && !last.preset && last.type !== 'alert' && Date.now() - last.time < 120000) {
+      text = `The ${last.type} "${last.message}" was already answered Cancel when it appeared (dialogs never stay open, so they can't freeze the tab). ` +
+        `The next one will be answered ${how}: repeat the action that showed it.`;
+    }
+    return { text };
   },
 
   // Reload an UNPACKED extension from disk (turn it off and on), e.g. after
@@ -747,73 +873,132 @@ const handlers = {
     return { text: `Reloaded "${now.name}" v${now.version} (${now.id}) from disk${now.enabled ? '' : ' — but it is now DISABLED (check chrome://extensions for errors)'}.\nTabs it already injected into still run the old content scripts: reload those tabs (navigate "reload") to use the new code.` };
   },
 
-  async upload_file({ tabId, ref, selector, paths } = {}, ctx) {
-    const files = Array.isArray(paths) ? paths : paths ? [paths] : [];
-    if (!files.length) throw new Error('paths (absolute file paths on this computer) is required.');
-    const tab = await resolveTab(ctx, tabId);
-    const token = Math.random().toString(36).slice(2) + Date.now().toString(36);
-    const info = await page(tab, 'tag', { ref, selector, token });
-    try {
-      if (info.tag !== 'INPUT' || String(info.type).toLowerCase() !== 'file') {
-        throw new Error(`Element ${info.description} is not an <input type="file">. Find the file input (it is often hidden; try find "file" or selector 'input[type=file]').`);
-      }
-      const finder = `(${function (tok) {
-        const sel = '[data-claude-bridge-tag="' + tok + '"]';
-        const search = (root) => {
-          const f = root.querySelector(sel);
-          if (f) return f;
-          for (const el of root.querySelectorAll('*')) {
-            if (el.shadowRoot) { const r = search(el.shadowRoot); if (r) return r; }
-            if (el.tagName === 'IFRAME') { try { const d = el.contentDocument; if (d) { const r = search(d); if (r) return r; } } catch (e) { /* cross-origin */ } }
-          }
-          return null;
-        };
-        return search(document);
-      }.toString()})(${JSON.stringify(token)})`;
-      const r = await cdp(tab.id, 'Runtime.evaluate', { expression: finder, returnByValue: false });
-      if (!r.result || !r.result.objectId) throw new Error('Could not locate the file input from the debugger (it may be in a closed shadow root).');
-      await cdp(tab.id, 'DOM.setFileInputFiles', { files, objectId: r.result.objectId });
-    } finally {
-      await page(tab, 'untag', { token }).catch(() => {});
+  async upload_file({ tabId, ref, selector, paths, files } = {}, ctx) {
+    const list = Array.isArray(paths) ? paths : paths ? [paths] : [];
+    if (!list.length) throw new Error('paths (absolute file paths on this computer) is required.');
+    if (!Array.isArray(files) || !files.length) {
+      throw new Error('This bridge server is too old to send file contents. Update it (run the setup command again) and restart Claude Code.');
     }
-    return { text: `Set ${files.length} file(s) on ${info.description}: ${files.join(', ')}\n` + (await settle(tab.id, Date.now(), null)) };
+    const tab = await resolveTab(ctx, tabId);
+    const since = Date.now();
+    const r = await page(tab, 'setFiles', { ref, selector, files }, 60000);
+    return { text: `Set ${r.names.length} file(s) on ${r.description}: ${list.join(', ')}\n` + (await settle(tab.id, since, null)) };
   },
 };
 
-async function typeChar(tabId, ch) {
-  const d = keyDef(ch);
-  const base = { key: d.key, code: d.code, windowsVirtualKeyCode: d.keyCode, nativeVirtualKeyCode: d.keyCode };
-  await cdp(tabId, 'Input.dispatchKeyEvent', { type: 'keyDown', ...base, text: ch, unmodifiedText: ch });
-  await cdp(tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', ...base });
+/** Press a key or combo in the focused element (forwarded into cross-origin frames). */
+async function pressCombo(tab, combo) {
+  const r = await framePage(tab, 'pressKey', comboEvent(combo));
+  return r && r.note ? r.note : '';
 }
 
-async function pressCombo(tabId, combo) {
-  const { modifiers, key } = parseCombo(combo);
-  let bits = 0;
-  for (const m of modifiers) {
-    bits |= modifierBits([m]);
-    const d = keyDef(m);
-    await cdp(tabId, 'Input.dispatchKeyEvent', {
-      type: 'rawKeyDown', modifiers: bits, key: d.key, code: d.code, windowsVirtualKeyCode: d.keyCode, nativeVirtualKeyCode: d.keyCode, location: 1,
-    });
+// ------------------------------------------------------------------ screenshots
+
+let lastCapture = 0;
+
+/** captureVisibleTab of the window's active tab, as an ImageBitmap (Chrome allows ~2 captures per second). */
+async function captureBitmap(windowId) {
+  const wait = lastCapture + 550 - Date.now();
+  if (wait > 0) await sleep(wait);
+  lastCapture = Date.now();
+  let url;
+  try {
+    url = await withTimeout(chrome.tabs.captureVisibleTab(windowId, { format: 'png' }), 15000, 'capture timed out');
+  } catch (e) {
+    const msg = e?.message || String(e);
+    if (/MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND/i.test(msg)) {
+      await sleep(1000);
+      lastCapture = Date.now();
+      url = await chrome.tabs.captureVisibleTab(windowId, { format: 'png' });
+    } else if (/timed out/.test(msg)) {
+      throw new Error('Chrome did not draw the page in time. If the Chrome window is hidden behind other windows or on a locked screen, bring it to the front and try again.');
+    } else {
+      throw new Error(`Screenshot failed: ${msg}`);
+    }
   }
-  const shift = modifiers.includes('Shift');
-  const d = keyDef(key, shift);
-  const withText = !!d.text && !modifiers.some((m) => m === 'Control' || m === 'Alt' || m === 'Meta');
-  const base = { modifiers: bits, key: d.key, code: d.code, windowsVirtualKeyCode: d.keyCode, nativeVirtualKeyCode: d.keyCode };
-  const down = { type: withText ? 'keyDown' : 'rawKeyDown', ...base };
-  if (withText) { down.text = d.text; down.unmodifiedText = d.text; }
-  const cmds = isMac ? macCommands(modifiers, key) : undefined;
-  if (cmds) down.commands = cmds;
-  await cdp(tabId, 'Input.dispatchKeyEvent', down);
-  await cdp(tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', ...base });
-  for (const m of [...modifiers].reverse()) {
-    bits &= ~modifierBits([m]);
-    const md = keyDef(m);
-    await cdp(tabId, 'Input.dispatchKeyEvent', {
-      type: 'keyUp', modifiers: bits, key: md.key, code: md.code, windowsVirtualKeyCode: md.keyCode, nativeVirtualKeyCode: md.keyCode, location: 1,
-    });
+  const blob = await (await fetch(url)).blob();
+  return createImageBitmap(blob);
+}
+
+function draw(canvas, bmp, sx, sy, sw, sh, dx, dy, dw, dh, fmt) {
+  const c = canvas.getContext('2d');
+  c.imageSmoothingQuality = 'high';
+  if (fmt === 'jpeg' && dx === 0 && dy === 0) { c.fillStyle = '#fff'; c.fillRect(0, 0, canvas.width, canvas.height); }
+  c.drawImage(bmp, sx, sy, sw, sh, dx, dy, dw, dh);
+}
+
+// ------------------------------------------------------------------ evaluate
+
+// Turns the value of the user's code into something that survives the trip back (JSON text, or a
+// description for DOM nodes, functions and other values JSON can't hold).
+const SER = `(v) => {
+  if (v === undefined) return { t: 'u' };
+  if (typeof v === 'function') return { t: 'd', d: '[function ' + (v.name || 'anonymous') + ']' };
+  if (typeof v === 'bigint') return { t: 'd', d: v + 'n' };
+  if (typeof v === 'number' && !isFinite(v)) return { t: 'd', d: String(v) };
+  if (typeof Node !== 'undefined' && v instanceof Node) return { t: 'd', d: v.nodeType === 1 ? v.outerHTML.slice(0, 5000) : String(v.textContent).slice(0, 5000) };
+  try {
+    const s = JSON.stringify(v, (k, x) => typeof x === 'bigint' ? x + 'n' : (typeof Node !== 'undefined' && x instanceof Node) ? '<' + x.nodeName.toLowerCase() + '>' : x);
+    return s === undefined ? { t: 'd', d: String(v) } : { t: 'j', j: s };
+  } catch (e) { return { t: 'd', d: String(v) }; }
+}`;
+const wrap = (fn) => `(async () => { const __ser = ${SER}; try { return __ser(await (${fn})()); } catch (e) { return { e: e && e.stack ? String(e.stack) : String(e) }; } })()`;
+
+async function userScriptsReady() {
+  try {
+    if (!chrome.userScripts || typeof chrome.userScripts.execute !== 'function') return false;
+    await chrome.userScripts.getScripts();
+    return true;
+  } catch (_) {
+    return false; // "Allow User Scripts" is off for this extension
   }
+}
+
+/**
+ * Run code in the page's own JavaScript world and describe the result. chrome.userScripts runs
+ * code even where the page's Content-Security-Policy forbids eval; without it (the user hasn't
+ * turned on "Allow User Scripts"), the code is eval'ed in the page, which strict pages refuse.
+ */
+async function runInPage(tabId, src, timeoutMs) {
+  const viaUserScripts = await userScriptsReady();
+  const exec = async (code) => {
+    let res;
+    if (viaUserScripts) {
+      [res] = await withTimeout(chrome.userScripts.execute({ target: { tabId }, js: [{ code }], world: 'MAIN', injectImmediately: true }), timeoutMs, `The code did not finish within ${timeoutMs} ms.`);
+    } else {
+      [res] = await withTimeout(chrome.scripting.executeScript({
+        target: { tabId }, world: 'MAIN', injectImmediately: true, args: [code],
+        func: (c) => { try { return (0, eval)(c); } catch (e) { return { e: (e && e.name === 'SyntaxError' ? 'SyntaxError: ' : '') + (e && e.message ? e.message : String(e)), evalBlocked: e instanceof EvalError || /unsafe-eval|Content Security Policy/i.test(String(e && e.message)) }; } },
+      }), timeoutMs, `The code did not finish within ${timeoutMs} ms.`);
+    }
+    if (!res) throw new Error('The page returned no result (it may be navigating).');
+    if (res.error) return { e: String(res.error) };
+    return res.result;
+  };
+  const isSyntax = (r) => r && r.e && /SyntaxError/.test(r.e);
+  const hasReturn = /(^|[;{}\n])\s*return\b/.test(src);
+  // 1. a function body when the code returns; 2. an expression (await allowed); 3. statements
+  // (their last value); 4. statements with await.
+  const attempts = hasReturn
+    ? [wrap(`async () => {\n${src}\n}`)]
+    : [wrap(`async () => (\n${src}\n)`), src, wrap(`async () => {\n${src}\n}`)];
+  let r;
+  for (const code of attempts) {
+    r = await exec(code);
+    if (!isSyntax(r)) break;
+  }
+  if (r && r.evalBlocked) {
+    throw new Error('This page\'s Content-Security-Policy blocks running JavaScript from a string. To run code on pages like this, turn on "Allow User Scripts" for Claude Browser Bridge (chrome://extensions → Claude Browser Bridge → Details), then try again. The other tools (snapshot, click, type, get_text…) work without it.');
+  }
+  if (r && r.e) throw new Error('JavaScript error: ' + r.e);
+  if (r && typeof r === 'object' && 't' in r) {
+    if (r.t === 'u') return 'undefined';
+    if (r.t === 'd') return r.d;
+    try { const v = JSON.parse(r.j); return typeof v === 'string' ? v : JSON.stringify(v, null, 2); } catch (_) { return r.j; }
+  }
+  // completion value of plain statements (3.)
+  if (r === undefined || r === null) return String(r);
+  return typeof r === 'string' ? r : JSON.stringify(r, null, 2);
 }
 
 export const METHODS = Object.keys(handlers);
