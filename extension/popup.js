@@ -247,7 +247,19 @@ let currentTab = null;
 
 /** The prompt a user pastes into any Claude Code session to make it drive this tab. */
 function buildPrompt(st, tab, owner, task) {
-  const script = (st.serverScript || '<path to claude_support_extension>/server/index.js').replace(/\\/g, '/');
+  const script = (st.serverScript || '').replace(/\\/g, '/');
+  // Without a known path, let the session find the project folder on this computer.
+  const install = script
+    ? [
+      'If you have no chrome-bridge tools (select_profile, tab_select, snapshot...), the MCP server is not registered in this Claude Code. In that case run this command:',
+      `  claude mcp add --scope user chrome-bridge -- node "${script}"`,
+    ]
+    : [
+      'If you have no chrome-bridge tools (select_profile, tab_select, snapshot...), the MCP server is not registered in this Claude Code. In that case:',
+      '  a. Find the Claude Browser Bridge project folder on this computer: it holds extension/manifest.json (name "Claude Browser Bridge") and server/index.js.',
+      '  b. Run "npm install" in its server folder.',
+      '  c. Run: claude mcp add --scope user chrome-bridge -- node "<absolute path of that server/index.js, with forward slashes>"',
+    ];
   const lines = [
     'Use my real Chrome browser through the chrome-bridge MCP tools (Claude Browser Bridge).',
     '',
@@ -271,8 +283,7 @@ function buildPrompt(st, tab, owner, task) {
       ? 'Task: ' + task
       : 'Task: when you are connected, tell me the page title and wait for my instructions.',
     '',
-    'If you have no chrome-bridge tools (select_profile, tab_select, snapshot...), the MCP server is not registered in this Claude Code. In that case run this command:',
-    `  claude mcp add --scope user chrome-bridge -- node "${script}"`,
+    ...install,
     'Then tell me to restart Claude Code and paste this prompt again. Stop there.',
   ];
   return lines.join('\n');

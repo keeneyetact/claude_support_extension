@@ -46,5 +46,13 @@ check('wrong token rejected', r.closed === 4001, JSON.stringify(r));
 r = await connect(b.port, { token: 's3cret' });
 check('right token accepted + server proves token', !!r.welcome && r.serverProofOk, JSON.stringify(r));
 
+// The id Chrome gave this extension folder when loaded unpacked on Windows (checked in Chrome).
+if (process.platform === 'win32') {
+  const { unpackedExtensionId } = await import('../extension-path.js');
+  const id = unpackedExtensionId('E:\\data\\claude_support_extension\\extension');
+  check('unpacked extension id matches Chrome', id === 'ahlbbbaigbipnnfoeebdjianckgegikb', id);
+  check('drive letter case does not change the id', unpackedExtensionId('e:\\data\\claude_support_extension\\extension') === id);
+}
+
 a.p.kill(); b.p.kill();
 process.exit(fails ? 1 : 0);

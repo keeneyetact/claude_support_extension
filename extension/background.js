@@ -44,17 +44,29 @@ let loopsStarted = false;
 /**
  * Exact path of server/index.js next to this extension folder, written by the server on
  * `npm install` and on every start (extension/server-path.json). Unpacked extensions read
- * their files from disk, so this sees the current file without a reload.
+ * their files from disk, so this sees the current file without a reload. The file is trusted
+ * only if it was written for this extension's id, which Chrome derives from the folder path:
+ * a copy of the project from another machine or folder carries a stale file.
  */
 async function localServerScript() {
   try {
     const res = await fetch(chrome.runtime.getURL('server-path.json'), { cache: 'no-store' });
     if (!res.ok) return '';
     const j = await res.json();
-    return typeof j.script === 'string' ? j.script : '';
+    if (typeof j.script !== 'string' || !Array.isArray(j.extensionIds) || !j.extensionIds.includes(chrome.runtime.id)) return '';
+    return j.script;
   } catch (_) {
     return '';
   }
+}
+
+/** Best known path of server/index.js on this machine, for the copied "claude mcp add" command. */
+async function bestServerScript() {
+  const local = await localServerScript();
+  if (local) return local;
+  // A server that is connected right now is running from a real path on this machine.
+  const live = openConns().map((c) => c.server && c.server.script).find((s) => typeof s === 'string' && s);
+  return live || serverScript;
 }
 
 // ------------------------------------------------------------------ init
@@ -426,7 +438,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           profileId,
           email,
           label: profileLabel(),
-          serverScript: (await localServerScript()) || serverScript,
+          serverScript: await bestServerScript(),
           ports: ports(),
           sessions,
           attachedTabs: attachedTabIds().length,
