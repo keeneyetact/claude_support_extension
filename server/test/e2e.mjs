@@ -12,6 +12,12 @@ import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 
+// The test servers must not pick up the Claude Code session that runs this test (its title would
+// replace the session names the checks look for).
+const serverEnv = { ...process.env };
+delete serverEnv.CLAUDE_CODE_SESSION_ID;
+delete serverEnv.CLAUDE_CODE_ENTRYPOINT;
+
 const here = path.dirname(fileURLToPath(import.meta.url));
 const serverPath = path.resolve(here, '..', 'index.js');
 const extPath = path.resolve(here, '..', '..', 'extension');
@@ -144,7 +150,7 @@ async function main() {
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [serverPath],
-    env: { ...process.env, CHROME_BRIDGE_CONNECT_WAIT_MS: '30000', CHROME_BRIDGE_PORT_START: String(TEST_PORT_START), CHROME_BRIDGE_PORT_COUNT: String(TEST_PORT_COUNT) },
+    env: { ...serverEnv, CHROME_BRIDGE_CONNECT_WAIT_MS: '30000', CHROME_BRIDGE_PORT_START: String(TEST_PORT_START), CHROME_BRIDGE_PORT_COUNT: String(TEST_PORT_COUNT) },
     stderr: 'pipe',
   });
   transport.stderr?.on('data', (d) => process.env.VERBOSE && process.stderr.write(d));
@@ -317,7 +323,7 @@ async function main() {
     await clientB.connect(new StdioClientTransport({
       command: process.execPath,
       args: [serverPath],
-      env: { ...process.env, CHROME_BRIDGE_CONNECT_WAIT_MS: '30000', CHROME_BRIDGE_PORT_START: String(TEST_PORT_START), CHROME_BRIDGE_PORT_COUNT: String(TEST_PORT_COUNT), CHROME_BRIDGE_SESSION_NAME: 'second-project' },
+      env: { ...serverEnv, CHROME_BRIDGE_CONNECT_WAIT_MS: '30000', CHROME_BRIDGE_PORT_START: String(TEST_PORT_START), CHROME_BRIDGE_PORT_COUNT: String(TEST_PORT_COUNT), CHROME_BRIDGE_SESSION_NAME: 'second-project' },
       stderr: 'pipe',
     }));
     const callB = (name, args = {}) => clientB.callTool({ name, arguments: args });
@@ -350,7 +356,7 @@ async function main() {
     if (process.env.DASHBOARD_SHOT) fs.writeFileSync(process.env.DASHBOARD_SHOT, Buffer.from(shot.data, 'base64'));
 
     // ---- "Copy prompt for Claude": the prompt names the profile, the tab, and how to connect
-    check('extension learned the server script path', /server[\\/]index\.js$/.test(st.serverScript || ''), st.serverScript);
+    check('extension learned the server start command', /^node ".*server\/index\.js"$/.test(st.serverCommand || ''), st.serverCommand);
     const owned = await browser.evaluate(popup, `chrome.runtime.sendMessage({ type: 'getStatus' }).then(async (st) => {
       const tab = await chrome.tabs.get(${Number(testTab)});
       const owner = st.sessions.find((s) => s.tab && s.tab.id === tab.id) || null;

@@ -13,34 +13,51 @@ Claude Code ──stdio(MCP)──► server/index.js ──ws://127.0.0.1:18765
 
 Several Chrome profiles can connect at the same time, and Claude picks one by name. Several Claude Code sessions can also run at once: each one binds the next free port in 18765–18774, and the extension connects to all of them.
 
-## Install
+## Install (about 2 minutes)
 
-### 1. Server dependencies
+You need **Google Chrome**, **[Claude Code](https://claude.com/claude-code)** (terminal, VS Code, Cursor or the desktop app) and **[Node.js](https://nodejs.org) 18 or newer**.
 
-```powershell
-cd E:\data\claude_support_extension\server
-npm install
+### 1. Run one command
+
+```
+npx -y claude-browser-bridge-mcp setup
 ```
 
-### 2. Register the MCP server with Claude Code (once, for all projects)
+This works the same on Windows, macOS and Linux, in any terminal. It:
 
-```powershell
-claude mcp add --scope user chrome-bridge -- node "E:/data/claude_support_extension/server/index.js"
+* installs the bridge in `~/.claude-browser-bridge`, so it keeps working after npx clears its cache;
+* registers it with Claude Code for all your projects (`claude mcp add --scope user chrome-bridge`). If `claude` isn't on your PATH, setup uses the copy bundled with the VS Code, Cursor or Windsurf extension;
+* opens Chrome on `chrome://extensions`, opens the extension folder, and copies the folder path to your clipboard.
+
+### 2. Add the extension to Chrome
+
+On the `chrome://extensions` page that setup opened:
+
+1. Turn on **Developer mode** (top right).
+2. Click **Load unpacked**, paste the folder path from your clipboard, and choose the folder.
+3. Pin the extension (puzzle icon → pin).
+
+Do this once in **each Chrome profile** you want Claude to use. Claude knows each profile by its signed-in email. To use a shorter name such as `Work`, set one in the extension's *Settings*.
+
+### 3. Use it
+
+Restart Claude Code, or start a new session. Then, in Chrome, click the extension icon → **Copy prompt for Claude** and paste the prompt into Claude Code. Or just ask Claude, for example *"In Chrome, summarise the page I have open."*
+
+**Update:** run the same `setup` command again, then click **Reload** on the extension in `chrome://extensions`.
+**Uninstall:** `npx -y claude-browser-bridge-mcp uninstall`, then remove the extension in each profile.
+**No pop-ups** (over SSH, for example): `setup --no-open` only prints the steps.
+
+### Install from a clone (for developers)
+
+```
+git clone <this repo> claude-browser-bridge
+cd claude-browser-bridge/server
+npm run setup
 ```
 
-If `claude` isn't on your PATH, use the copy bundled with the VS Code extension:
-`& "$env:USERPROFILE\.vscode\extensions\anthropic.claude-code-<version>-win32-x64\resources\native-binary\claude.exe" mcp add ...`
+`npm run setup` installs the dependencies and registers this folder's `server/index.js` with Claude Code. Load `extension/` unpacked, as in step 2. After you edit the extension, click **Reload** on its card in `chrome://extensions` (or ask Claude to run `extension_reload`).
 
-Then restart Claude Code, or start a new session, and check with `/mcp` that **chrome-bridge** is connected.
-
-### 3. Load the extension into each Chrome profile
-
-1. In the profile, open `chrome://extensions`.
-2. Turn on **Developer mode** (top right).
-3. Click **Load unpacked** and pick `E:\data\claude_support_extension\extension`.
-4. Pin the extension and click its icon. Under *Settings*, give the profile a name such as `Work` or `Personal`. Claude uses that name to address the profile.
-
-Repeat this for every profile. While a Claude session is running, the toolbar badge shows how many Claude sessions are connected.
+To register by hand instead: `claude mcp add --scope user chrome-bridge -- node "<absolute path>/server/index.js"`.
 
 ## Use
 
@@ -50,7 +67,7 @@ Repeat this for every profile. While a Claude session is running, the toolbar ba
 2. Click the extension icon. Optionally, type what Claude should do.
 3. Click **Copy prompt for Claude** and paste it into any Claude Code session.
 
-The prompt tells the session which profile and tab to use (`select_profile`, then `tab_select`), what to do if the tab id has changed, and to stay in that tab. If another session holds the tab, the prompt says you're handing it over (`takeOver: true`). If the session doesn't have the chrome-bridge tools yet, the prompt gives it the exact `claude mcp add` command to run, and it asks you to restart. The path in that command comes from `extension/server-path.json`, which the server writes with its own absolute path on `npm install` and each time it starts. The file also records the extension id Chrome derives from the extension folder's path, and the extension ignores the file when that id isn't its own. So if you hand this project to someone else, even as a copied folder, they see the path on their own machine once they have run `npm install` in `server/`. Until then, the prompt tells their Claude session how to find the folder.
+The prompt tells the session which profile and tab to use (`select_profile`, then `tab_select`), what to do if the tab id has changed, and to stay in that tab. If another session holds the tab, the prompt says you're handing it over (`takeOver: true`). If the session doesn't have the chrome-bridge tools yet, the prompt includes the command that adds them, and the session then asks you to restart. When the bridge is installed on this computer, that's the exact `claude mcp add` command for your install: the server writes it to `extension/server-path.json` each time it starts, and a connected server reports it too. The extension uses that file only if it was written for its own folder, so a copied project never shows another machine's path. Before anything is installed, the prompt gives the one-line `npx -y claude-browser-bridge-mcp setup`.
 
 To have several sessions work at once, copy a prompt from a different tab for each one.
 
@@ -153,17 +170,23 @@ Chrome doesn't let any extension control `chrome://` pages, the Chrome Web Store
 
 ## Development
 
-```powershell
+```
 cd server
 npm test        # protocol/security tests + full end-to-end test
 ```
 
 The end-to-end test starts an **isolated** Chrome with a temporary profile, so your real profiles aren't touched. It loads the extension through CDP `Extensions.loadUnpacked`, drives the MCP server through a real MCP client, and checks every tool against a local test page. Set `HEADED=1` to watch it, or `CHROME_PATH` to pick a browser.
 
-After you edit the extension, click **Reload** on its card in `chrome://extensions`.
+### Releasing
+
+The server and the extension share a version. Bump it in `server/package.json` and `extension/manifest.json` together.
+
+* **npm:** `cd server && npm publish`. `prepack` copies `extension/` into the package, so `npx … setup` installs the extension that matches the server.
+* **Chrome Web Store:** `npm run pack-extension` writes `dist/claude-browser-bridge-<version>.zip`. Upload it in the [developer dashboard](https://chrome.google.com/webstore/devconsole). Once the extension is listed, set `WEB_STORE_URL` in `server/setup.js`. Setup then opens the store page ("Add to Chrome") instead of walking people through Developer mode, and Chrome keeps the extension up to date.
 
 ### Troubleshooting
 
+* **Setup says it can't find Claude Code**: install Claude Code, then run setup again, or run the `claude mcp add …` command it prints.
 * **"No Chrome profile is connected"**
   * Open the extension popup. It should say *Connected to N Claude session(s)*.
   * If it says *Waiting…*, make sure the bridge is switched on in the popup and the port ranges match.

@@ -34,7 +34,7 @@ let settings = { ...DEFAULTS };
 let profileId = null;
 let email = '';
 /** Path of server/index.js, learned from the last session that connected (for the copied prompt). */
-let serverScript = '';
+let serverCommand = ''; // what follows "claude mcp add --scope user chrome-bridge --"
 /** port -> connection; once open it is also the session context used by commands.js */
 const conns = new Map();
 const activity = [];
@@ -42,31 +42,38 @@ let initPromise = null;
 let loopsStarted = false;
 
 /**
- * Exact path of server/index.js next to this extension folder, written by the server on
+ * Command that starts the server next to this extension folder, written by the server on
  * `npm install` and on every start (extension/server-path.json). Unpacked extensions read
  * their files from disk, so this sees the current file without a reload. The file is trusted
  * only if it was written for this extension's id, which Chrome derives from the folder path:
  * a copy of the project from another machine or folder carries a stale file.
  */
-async function localServerScript() {
+async function localServerCommand() {
   try {
     const res = await fetch(chrome.runtime.getURL('server-path.json'), { cache: 'no-store' });
     if (!res.ok) return '';
     const j = await res.json();
-    if (typeof j.script !== 'string' || !Array.isArray(j.extensionIds) || !j.extensionIds.includes(chrome.runtime.id)) return '';
-    return j.script;
+    if (!Array.isArray(j.extensionIds) || !j.extensionIds.includes(chrome.runtime.id)) return '';
+    return commandOf(j);
   } catch (_) {
     return '';
   }
 }
 
-/** Best known path of server/index.js on this machine, for the copied "claude mcp add" command. */
-async function bestServerScript() {
-  const local = await localServerScript();
+/** The start command a server (or server-path.json) reports; older servers only sent the path. */
+function commandOf(s) {
+  if (!s) return '';
+  if (typeof s.command === 'string' && s.command) return s.command;
+  return typeof s.script === 'string' && s.script ? `node "${s.script.replace(/\\/g, '/')}"` : '';
+}
+
+/** Best known server start command on this machine, for the copied "claude mcp add" command. */
+async function bestServerCommand() {
+  const local = await localServerCommand();
   if (local) return local;
-  // A server that is connected right now is running from a real path on this machine.
-  const live = openConns().map((c) => c.server && c.server.script).find((s) => typeof s === 'string' && s);
-  return live || serverScript;
+  // A server that is connected right now is running on this machine.
+  const live = openConns().map((c) => commandOf(c.server)).find(Boolean);
+  return live || serverCommand;
 }
 
 // ------------------------------------------------------------------ init
@@ -74,8 +81,8 @@ async function bestServerScript() {
 function init() {
   if (!initPromise) {
     initPromise = (async () => {
-      const stored = await chrome.storage.local.get(['settings', 'profileId', 'serverScript']);
-      serverScript = stored.serverScript || '';
+      const stored = await chrome.storage.local.get(['settings', 'profileId', 'serverCommand']);
+      serverCommand = stored.serverCommand || '';
       settings = { ...DEFAULTS, ...(stored.settings || {}) };
       configure({ groupTabs: settings.groupTabs });
       profileId = stored.profileId;
@@ -344,10 +351,10 @@ function startSession(c) {
     badge: 'C' + n,
     badgeColor: hex,
   });
-  const script = typeof c.server.script === 'string' ? c.server.script : '';
-  if (script && script !== serverScript) {
-    serverScript = script;
-    chrome.storage.local.set({ serverScript }).catch(() => {});
+  const command = commandOf(c.server);
+  if (command && command !== serverCommand) {
+    serverCommand = command;
+    chrome.storage.local.set({ serverCommand }).catch(() => {});
   }
 }
 
@@ -438,7 +445,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           profileId,
           email,
           label: profileLabel(),
-          serverScript: await bestServerScript(),
+          serverCommand: await bestServerCommand(),
           ports: ports(),
           sessions,
           attachedTabs: attachedTabIds().length,

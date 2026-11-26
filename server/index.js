@@ -10,7 +10,7 @@ import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { readFileSync, existsSync, readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { writeExtensionPath } from './extension-path.js';
+import { writeExtensionPath, serverCommand } from './extension-path.js';
 import { WebSocketServer } from 'ws';
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -281,6 +281,8 @@ class Bridge {
             label: SESSION_NAME,
             // Lets the extension build a copy-paste 'claude mcp add' command for new sessions.
             script: fileURLToPath(import.meta.url),
+            // The whole command after "claude mcp add ... --" (node + path, or npx + package).
+            command: serverCommand(),
             // The Claude Code session: id, conversation title, editor/terminal, busy/idle.
             session: sessionInfo.info,
           },
@@ -674,7 +676,13 @@ async function main() {
   process.on('SIGTERM', shutdown);
 }
 
-main().catch((e) => {
-  log('fatal:', e.message);
-  process.exit(1);
-});
+const cli = process.argv[2];
+if (['setup', 'install', 'uninstall', 'help', '--help', '-h'].includes(cli)) {
+  // `setup`, `uninstall`, `help`: for people installing, not for Claude Code.
+  import('./setup.js').then((m) => m.runCli(cli, process.argv.slice(3)));
+} else {
+  main().catch((e) => {
+    log('fatal:', e.message);
+    process.exit(1);
+  });
+}

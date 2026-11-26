@@ -239,6 +239,9 @@ function renderSessions(st) {
 
 // ---------------------------------------------------------------- hand a tab to Claude
 
+// npm package with the MCP server; `npx -y <it> setup` installs and registers it in one step.
+const NPM_PACKAGE = 'claude-browser-bridge-mcp';
+
 // Pages no extension may control.
 const RESTRICTED = /^(chrome|edge|about|devtools|view-source|chrome-extension|chrome-search|chrome-untrusted):|^https:\/\/(chromewebstore\.google\.com|chrome\.google\.com\/webstore)/i;
 
@@ -247,18 +250,16 @@ let currentTab = null;
 
 /** The prompt a user pastes into any Claude Code session to make it drive this tab. */
 function buildPrompt(st, tab, owner, task) {
-  const script = (st.serverScript || '').replace(/\\/g, '/');
-  // Without a known path, let the session find the project folder on this computer.
-  const install = script
+  const command = st.serverCommand || '';
+  // Without a known command (nothing installed yet), the one-line setup installs and registers it.
+  const install = command
     ? [
       'If you have no chrome-bridge tools (select_profile, tab_select, snapshot...), the MCP server is not registered in this Claude Code. In that case run this command:',
-      `  claude mcp add --scope user chrome-bridge -- node "${script}"`,
+      `  claude mcp add --scope user chrome-bridge -- ${command}`,
     ]
     : [
-      'If you have no chrome-bridge tools (select_profile, tab_select, snapshot...), the MCP server is not registered in this Claude Code. In that case:',
-      '  a. Find the Claude Browser Bridge project folder on this computer: it holds extension/manifest.json (name "Claude Browser Bridge") and server/index.js.',
-      '  b. Run "npm install" in its server folder.',
-      '  c. Run: claude mcp add --scope user chrome-bridge -- node "<absolute path of that server/index.js, with forward slashes>"',
+      'If you have no chrome-bridge tools (select_profile, tab_select, snapshot...), the MCP server is not installed yet. In that case run this command (it needs Node.js 18 or newer):',
+      `  npx -y ${NPM_PACKAGE} setup`,
     ];
   const lines = [
     'Use my real Chrome browser through the chrome-bridge MCP tools (Claude Browser Bridge).',

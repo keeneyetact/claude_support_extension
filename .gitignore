@@ -3,3 +3,8 @@ node_modules/
 .DS_Store
 # Written by the server with its own absolute path (see server/extension-path.js).
 extension/server-path.json
+
+# Copy of extension/ made by `npm pack` (server/scripts/bundle-extension.js).
+server/extension/
+# Chrome Web Store zip (npm run pack-extension).
+dist/
